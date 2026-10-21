@@ -1,0 +1,39 @@
+# Secretos locales
+.env
+.env.*
+!.env.example
+
+# Config local de herramientas (puede tener tokens)
+.mcp.json
+*.mcp.json
+.claude/settings.local.json
+
+# Binarios y temporales
+/api
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+coverage.*
+tmp/
+
+# Logs
+*.log
+
+# Editores / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini

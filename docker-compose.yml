@@ -1,0 +1,30 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: veripago_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?Definí DB_ROOT_PASSWORD en .env}
+      MYSQL_DATABASE: veripago_db
+      MYSQL_USER: ${DB_USER:?Definí DB_USER en .env}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?Definí DB_PASSWORD en .env}
+      TZ: America/Argentina/Buenos_Aires
+    ports:
+      - "127.0.0.1:3306:3306" # solo accesible desde esta máquina
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./migrations/0001_init_schema.sql:/docker-entrypoint-initdb.d/0001_init_schema.sql:ro
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  redis:
+    image: redis:7-alpine
+    container_name: veripago_redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379" # solo accesible desde esta máquina
+    volumes:
+      - redis_data:/data
+
+volumes:
+  mysql_data:
+  redis_data:

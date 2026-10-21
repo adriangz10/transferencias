@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex" />
+  <title>VeriPago</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f9d6b'/%3E%3Cpath d='M9 16.5l4.5 4.5L23 11.5' stroke='white' stroke-width='3.2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg: #f4f6f8; --card: #ffffff; --text: #1d2733; --muted: #64707d; --border: #e1e6eb; --soft: #f0f3f6;
+      --brand: #0f9d6b; --brand-hover: #0b8058; --brand-soft: #e3f5ee;
+      --ok: #12805c; --ok-bg: #e3f5ee; --warn: #9a6200; --warn-bg: #fdf3dc; --bad: #b42323; --bad-bg: #fdecec;
+      --info-bg: #e8f1fd; --info: #1d5fb8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11161c; --card: #1a2129; --text: #e8edf2; --muted: #9aa6b2; --border: #2c3640; --soft: #222b34;
+        --brand: #19b37e; --brand-hover: #20c98e; --brand-soft: #173a2e;
+        --ok: #5fd6a6; --ok-bg: #173a2e; --warn: #f2c063; --warn-bg: #3a2f17; --bad: #ff9b9b; --bad-bg: #3a1c1c;
+        --info-bg: #182a40; --info: #8dbbf5;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; font-size: 15px; line-height: 1.45;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+    .hidden { display: none !important; }
+
+    header { background: var(--card); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; }
+    header .wrap { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 12px; padding-bottom: 12px; }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .logo-mark { width: 36px; height: 36px; flex: none; border-radius: 9px; background: var(--brand); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; }
+    .brand-name { font-weight: 700; font-size: 17px; }
+    .brand-sub { color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    nav { display: flex; gap: 4px; overflow-x: auto; margin: 20px 0 16px; border-bottom: 1px solid var(--border); }
+    nav button {
+      background: none; border: 0; border-bottom: 3px solid transparent; padding: 10px 14px; font-size: 15px;
+      color: var(--muted); cursor: pointer; white-space: nowrap; font-weight: 600;
+    }
+    nav button.active { color: var(--brand); border-bottom-color: var(--brand); }
+
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 17px; margin: 0 0 4px; }
+    .card p.help { color: var(--muted); margin: 0 0 16px; font-size: 14px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .two-col > .card { margin-bottom: 0; }
+
+    .tile { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; }
+    .tile .num { font-size: 30px; font-weight: 700; }
+    .tile .lbl { color: var(--muted); font-size: 14px; }
+    .tile.ok .num { color: var(--ok); } .tile.bad .num { color: var(--bad); } .tile.warn .num { color: var(--warn); }
+
+    label { display: block; font-size: 14px; font-weight: 600; margin: 12px 0 6px; }
+    label .opt { color: var(--muted); font-weight: 400; }
+    input, select {
+      width: 100%; padding: 10px 12px; font-size: 15px; border-radius: 9px;
+      border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    }
+    input:focus, select:focus { outline: 2px solid var(--brand); outline-offset: 1px; border-color: transparent; }
+    input[type=file] { padding: 8px; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 10px 16px;
+      font-size: 15px; font-weight: 600; border-radius: 9px; border: 1px solid transparent; cursor: pointer; text-decoration: none;
+      background: var(--brand); color: #fff;
+    }
+    .btn:hover { background: var(--brand-hover); }
+    .btn:disabled { opacity: .6; cursor: wait; }
+    .btn.secondary { background: var(--card); color: var(--text); border-color: var(--border); }
+    .btn.secondary:hover { background: var(--soft); }
+    .btn.small { padding: 6px 10px; font-size: 13px; }
+    .btn.link { background: none; color: var(--bad); padding: 4px 6px; font-weight: 500; }
+    .btn.link:hover { text-decoration: underline; background: none; }
+    .btn.full { width: 100%; margin-top: 16px; }
+
+    .banner { border-radius: 12px; padding: 12px 14px; margin-top: 16px; font-size: 14px; }
+    .banner.warn { background: var(--warn-bg); color: var(--warn); }
+    .banner.bad { background: var(--bad-bg); color: var(--bad); }
+    .banner.ok { background: var(--ok-bg); color: var(--ok); }
+
+    .steps { list-style: none; padding: 0; margin: 0; }
+    .steps li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+    .steps li:first-child { border-top: 0; }
+    .steps .dot { width: 26px; height: 26px; flex: none; border-radius: 50%; border: 2px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: var(--muted); }
+    .steps li.done .dot { background: var(--ok); border-color: var(--ok); color: #fff; }
+    .steps li.done .txt { color: var(--muted); text-decoration: line-through; }
+    .steps .txt { flex: 1; }
+
+    .list { list-style: none; padding: 0; margin: 0; }
+    .list li { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--border); }
+    .list li:first-child { border-top: 0; }
+    .list .icon { width: 36px; height: 36px; flex: none; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+    .icon.ok { background: var(--ok-bg); color: var(--ok); } .icon.bad { background: var(--bad-bg); color: var(--bad); }
+    .icon.warn { background: var(--warn-bg); color: var(--warn); } .icon.info { background: var(--info-bg); color: var(--info); }
+    .list .main { flex: 1; min-width: 0; }
+    .list .title { font-weight: 600; }
+    .list .meta { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+    .list .side { text-align: right; flex: none; }
+    .amount { font-weight: 700; font-variant-numeric: tabular-nums; }
+    .tag { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; }
+    .tag.ok { background: var(--ok-bg); color: var(--ok); } .tag.bad { background: var(--bad-bg); color: var(--bad); }
+    .tag.warn { background: var(--warn-bg); color: var(--warn); } .tag.muted { background: var(--soft); color: var(--muted); }
+    .empty { color: var(--muted); text-align: center; padding: 20px 0; font-size: 14px; }
+
+    .result { border-radius: 12px; padding: 14px; margin-top: 14px; }
+    .result.ok { background: var(--ok-bg); } .result.bad { background: var(--bad-bg); } .result.warn { background: var(--warn-bg); }
+    .result .r-title { font-weight: 700; margin-bottom: 4px; }
+
+    .big-amount { text-align: center; background: var(--brand-soft); border-radius: 14px; padding: 20px; margin-top: 16px; }
+    .big-amount .value { font-size: 38px; font-weight: 800; font-variant-numeric: tabular-nums; margin: 6px 0; }
+
+    .bar { height: 10px; background: var(--soft); border-radius: 99px; overflow: hidden; margin-top: 8px; }
+    .bar > div { height: 100%; background: var(--brand); width: 0; transition: width .3s; }
+
+    details { margin-top: 12px; }
+    details summary { cursor: pointer; color: var(--muted); font-size: 14px; font-weight: 600; }
+
+    .chat { background: var(--soft); border-radius: 12px; padding: 12px; height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+    .bubble { max-width: 85%; padding: 8px 12px; border-radius: 12px; font-size: 14px; background: var(--card); border: 1px solid var(--border); }
+    .bubble.out { align-self: flex-end; background: var(--brand-soft); }
+    .bubble .who { font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+    .scenarios { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
+    .scenarios button { text-align: left; }
+
+    .toast {
+      position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--text); color: var(--bg);
+      padding: 10px 18px; border-radius: 10px; font-size: 14px; z-index: 50; max-width: calc(100% - 32px);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="brand">
+        <div class="logo-mark" aria-hidden="true">✓</div>
+        <div style="min-width:0">
+          <div class="brand-name">VeriPago</div>
+          <div class="brand-sub" id="business-name">&nbsp;</div>
+        </div>
+      </div>
+      <form id="logout-form" method="post" action="/logout" class="hidden">
+        <button class="btn secondary small" type="submit">Salir</button>
+      </form>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div id="demo-banner" class="banner warn hidden">
+      <b>Modo de prueba.</b> Los pagos son simulados. No lo uses con clientes reales.
+    </div>
+    <div id="error-banner" class="banner bad hidden" role="alert"></div>
+    <div id="oauth-banner" class="banner ok hidden">Mercado Pago quedó vinculado.</div>
+
+    <!-- Primeros pasos: solo se muestra mientras falte algo -->
+    <section id="setup-card" class="card hidden" style="margin-top:16px">
+      <h2>Primeros pasos</h2>
+      <p class="help">Completá estos pasos para empezar a verificar cobros.</p>
+      <ul class="steps">
+        <li id="step-mp"><span class="dot">1</span><span class="txt">Vinculá tu cuenta de Mercado Pago</span><a class="btn small" href="/oauth/mp/connect">Vincular</a></li>
+        <li id="step-account"><span class="dot">2</span><span class="txt">Cargá tu alias y CVU</span><button class="btn small secondary" onclick="goTo('settings', 'account-alias')">Cargar</button></li>
+        <li id="step-senders"><span class="dot">3</span><span class="txt">Agregá a quienes te reenvían los comprobantes por WhatsApp</span><button class="btn small secondary" onclick="goTo('settings', 'new-sender-name')">Agregar</button></li>
+      </ul>
+    </section>
+
+    <nav>
+      <button data-tab="home" class="active" onclick="switchTab('home')">Inicio</button>
+      <button data-tab="charge" onclick="switchTab('charge')">Cobrar</button>
+      <button data-tab="settings" onclick="switchTab('settings')">Configuración</button>
+      <button data-tab="demo" class="demo-only hidden" onclick="switchTab('demo')">Pruebas</button>
+    </nav>
+
+    <!-- ================= INICIO ================= -->
+    <section id="tab-home">
+      <div class="grid-3">
+        <div class="tile ok"><div class="num" id="kpi-ok">0</div><div class="lbl">Aprobados hoy</div></div>
+        <div class="tile bad"><div class="num" id="kpi-bad">0</div><div class="lbl">Rechazados hoy</div></div>
+        <div class="tile warn"><div class="num" id="kpi-wait">0</div><div class="lbl">Esperando el dinero</div></div>
+      </div>
+
+      <div id="pending-card" class="card hidden">
+        <h2>Esperando que llegue el dinero</h2>
+        <p class="help">A veces el banco tarda unos minutos. Si el pago entra, se avisa solo por WhatsApp.</p>
+        <ul class="list" id="pending-list"></ul>
+      </div>
+
+      <div class="card">
+        <h2>Verificar un comprobante</h2>
+        <p class="help">Subí la foto o el PDF y te decimos si el pago entró de verdad.</p>
+        <form id="upload-form" onsubmit="uploadReceipt(event)">
+          <div class="row">
+            <input type="file" id="receipt-file" accept="image/*,application/pdf" required style="flex:1;min-width:200px" />
+            <button class="btn" type="submit" id="upload-btn">Verificar</button>
+          </div>
+        </form>
+        <div id="upload-result" class="result hidden"></div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:8px">
+          <h2 style="margin:0">Últimos comprobantes</h2>
+          <a class="btn secondary small" href="/api/v1/export/validations.csv">Descargar Excel</a>
+        </div>
+        <ul class="list" id="receipts-list"></ul>
+        <button class="btn secondary small hidden" id="receipts-more" onclick="showAllReceipts = true; render()" style="margin-top:8px">Ver más</button>
+
+        <details>
+          <summary>Pagos que entraron a Mercado Pago</summary>
+          <ul class="list" id="payments-list" style="margin-top:8px"></ul>
+        </details>
+      </div>
+    </section>
+
+    <!-- ================= COBRAR ================= -->
+    <section id="tab-charge" class="hidden">
+      <div class="two-col">
+        <div class="card">
+          <h2>Nuevo cobro</h2>
+          <p class="help">Te damos un monto con unos pesos de diferencia para reconocer al instante la transferencia de ese cliente.</p>
+          <form onsubmit="createCharge(event)">
+            <label for="charge-amount">Monto a cobrar ($)</label>
+            <input type="number" id="charge-amount" step="0.01" min="1" inputmode="decimal" required placeholder="10000" />
+            <label for="charge-ref">Descripción <span class="opt">(opcional)</span></label>
+            <input type="text" id="charge-ref" maxlength="100" placeholder="Ej: Mesa 4" />
+            <button class="btn full" type="submit">Generar monto</button>
+          </form>
+          <div id="charge-result" class="big-amount hidden">
+            <div>Pedile al cliente que transfiera exactamente:</div>
+            <div class="value" id="charge-value"></div>
+            <div style="color:var(--muted);font-size:14px">a <b id="charge-alias"></b></div>
+            <div class="row" style="justify-content:center;margin-top:12px">
+              <button class="btn secondary small" onclick="copyAmount()">Copiar monto</button>
+              <button class="btn small demo-only hidden" onclick="simulatePayment(lastCharge && lastCharge.unique_amount)">Simular pago</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Cobros de hoy</h2>
+          <p class="help">Cuando el cliente paga, el estado cambia solo.</p>
+          <ul class="list" id="charges-list"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= CONFIGURACIÓN ================= -->
+    <section id="tab-settings" class="hidden">
+      <div class="two-col">
+        <div class="card">
+          <h2>Mercado Pago</h2>
+          <p class="help" id="mp-status-text">Cargando…</p>
+          <a class="btn secondary" href="/oauth/mp/connect" id="mp-connect-btn">Vincular Mercado Pago</a>
+        </div>
+
+        <div class="card">
+          <h2>Tu cuenta para recibir transferencias</h2>
+          <p class="help">La usamos para comprobar que el dinero llegó a vos y no a otra cuenta.</p>
+          <form onsubmit="saveAccount(event)">
+            <label for="account-alias">Alias</label>
+            <input type="text" id="account-alias" placeholder="mi.negocio.mp" autocomplete="off" />
+            <label for="account-cvu">CVU o CBU <span class="opt">(22 números)</span></label>
+            <input type="text" id="account-cvu" inputmode="numeric" placeholder="0000003100000000000000" autocomplete="off" />
+            <button class="btn full" type="submit">Guardar</button>
+          </form>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px">
+        <h2>Personas autorizadas</h2>
+        <p class="help">Solo estos números de WhatsApp pueden reenviarle comprobantes al bot. No ven tu saldo ni tu cuenta.</p>
+        <ul class="list" id="senders-list"></ul>
+        <form onsubmit="addSender(event)" style="margin-top:12px">
+          <div class="two-col" style="gap:10px">
+            <div>
+              <label for="new-sender-name">Nombre</label>
+              <input type="text" id="new-sender-name" required maxlength="100" placeholder="Ej: Marcos" />
+            </div>
+            <div>
+              <label for="new-sender-phone">WhatsApp <span class="opt">(con código de país)</span></label>
+              <input type="tel" id="new-sender-phone" required placeholder="5491155004444" />
+            </div>
+            <div>
+              <label for="new-sender-role">Qué hace</label>
+              <select id="new-sender-role">
+                <option value="CASHIER">Cajero/a</option>
+                <option value="DELIVERY">Repartidor/a</option>
+                <option value="OWNER">Dueño/a (recibe las alertas)</option>
+              </select>
+            </div>
+          </div>
+          <button class="btn" type="submit" style="margin-top:14px">Agregar</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Tu plan</h2>
+        <p class="help" id="quota-text">&nbsp;</p>
+        <div class="bar"><div id="quota-bar"></div></div>
+
+        <details>
+          <summary>Opciones avanzadas</summary>
+          <form onsubmit="savePlan(event)">
+            <label for="settings-plan">Plan</label>
+            <select id="settings-plan"></select>
+            <label for="settings-window">Cuánto tiempo hacia atrás buscar un pago sin número de operación <span class="opt">(minutos)</span></label>
+            <input type="number" id="settings-window" min="5" max="1440" />
+            <button class="btn secondary" type="submit" style="margin-top:14px">Guardar</button>
+          </form>
+          <p class="help" id="system-status" style="margin-top:16px;margin-bottom:0"></p>
+        </details>
+      </div>
+    </section>
+
+    <!-- ================= PRUEBAS (solo modo demo) ================= -->
+    <section id="tab-demo" class="hidden">
+      <div class="card">
+        <h2>Probar casos</h2>
+        <p class="help">Simula que un empleado reenvía un comprobante. No usa APIs reales.</p>
+        <label for="sim-sender">Quién lo envía</label>
+        <select id="sim-sender" style="margin-bottom:12px"></select>
+        <div class="scenarios">
+          <button class="btn secondary" onclick="runScenario('EXACT_MP_VALID')">✅ Pago válido</button>
+          <button class="btn secondary" onclick="runScenario('HEURISTIC_CVU_VALID')">✅ Transferencia de otro banco</button>
+          <button class="btn secondary" onclick="runScenario('FRAUD_DUPLICATE_SHA256')">🚫 Comprobante repetido</button>
+          <button class="btn secondary" onclick="runScenario('FRAUD_DOUBLE_SPEND_ID')">🚫 Pago ya usado</button>
+          <button class="btn secondary" onclick="runScenario('FRAUD_INCOMPLETE_TRANSFER')">🚫 Transferencia sin terminar</button>
+          <button class="btn secondary" onclick="runScenario('REJECTED_WRONG_DESTINATION')">🚫 Enviado a otra cuenta</button>
+          <button class="btn secondary" onclick="runScenario('DELAYED_COELSA_QUEUE')">⏳ El banco demora</button>
+          <button class="btn secondary" onclick="simulatePayment()">💸 Simular que entra un pago</button>
+        </div>
+        <div id="demo-result" class="result hidden"></div>
+      </div>
+
+      <div class="card">
+        <h2>Chat del bot</h2>
+        <div class="chat" id="chat"></div>
+        <form onsubmit="sendCommand(event)" class="row" style="margin-top:10px">
+          <input type="text" id="chat-input" placeholder="Probá: /cobrar 15000 Mesa 2" style="flex:1;min-width:180px" />
+          <button class="btn" type="submit">Enviar</button>
+        </form>
+      </div>
+    </section>
+
+    <div style="height:32px"></div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script>
+    // ---------- Utilidades ----------
+    // Todo lo que viene del servidor se escapa antes de insertarlo como HTML.
+    function esc(v) {
+      return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    const moneyFmt = new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS', minimumFractionDigits: 2 });
+    function money(v) { const n = Number(v); return moneyFmt.format(isFinite(n) ? n : 0); }
+    function time(v) { const d = new Date(v); return isNaN(d) ? '' : d.toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }); }
+    function when(v) {
+      const d = new Date(v);
+      if (isNaN(d)) return '';
+      const today = new Date().toDateString() === d.toDateString();
+      return today ? 'Hoy ' + time(v) : d.toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' }) + ' ' + time(v);
+    }
+    function isToday(v) { const d = new Date(v); return !isNaN(d) && d.toDateString() === new Date().toDateString(); }
+    // Formato de WhatsApp: *negrita* (después de escapar)
+    function waText(s) { return esc(s).replace(/\*(.*?)\*/g, '<b>$1</b>').replace(/\n/g, '<br>'); }
+
+    function toast(msg) {
+      const el = document.getElementById('toast');
+      el.textContent = msg;
+      el.classList.remove('hidden');
+      clearTimeout(toast.t);
+      toast.t = setTimeout(() => el.classList.add('hidden'), 2500);
+    }
+    function showError(msg) {
+      const el = document.getElementById('error-banner');
+      el.textContent = msg || '';
+      el.classList.toggle('hidden', !msg);
+    }
+    async function api(url, opts) {
+      const res = await fetch(url, Object.assign({ credentials: 'same-origin' }, opts));
+      if (res.status === 401) { location.href = '/login'; throw new Error('sesión vencida'); }
+      let data = null;
+      try { data = await res.json(); } catch (_) { data = null; }
+      if (!res.ok) {
+        const msg = (data && data.error) ? data.error : 'Algo salió mal (error ' + res.status + '). Probá de nuevo.';
+        showError(msg);
+        throw new Error(msg);
+      }
+      showError('');
+      return data;
+    }
+    function postJSON(url, body) {
+      return api(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    }
+
+    // ---------- Textos de cada resultado ----------
+    const RESULT = {
+      VERIFIED_EXACT_ID:          { kind: 'ok',   icon: '✓', text: 'Pago confirmado' },
+      VERIFIED_HEURISTIC:         { kind: 'ok',   icon: '✓', text: 'Pago confirmado' },
+      REJECTED_NOT_FOUND:         { kind: 'warn', icon: '?', text: 'El pago no aparece en Mercado Pago' },
+      REJECTED_WRONG_DESTINATION: { kind: 'bad',  icon: '✕', text: 'Se transfirió a otra cuenta' },
+      REJECTED_AMOUNT_MISMATCH:   { kind: 'bad',  icon: '✕', text: 'El monto no coincide con el pago' },
+      FRAUD_ALREADY_USED:         { kind: 'bad',  icon: '✕', text: 'Ese pago ya se usó en otra venta' },
+      FRAUD_DUPLICATE_FILE:       { kind: 'bad',  icon: '✕', text: 'Comprobante repetido' },
+      FRAUD_INCOMPLETE_TRANSFER:  { kind: 'bad',  icon: '✕', text: 'La transferencia no se terminó' },
+      INVALID_RECEIPT_IMAGE:      { kind: 'warn', icon: '?', text: 'No parece un comprobante' },
+      QUOTA_EXCEEDED:             { kind: 'warn', icon: '!', text: 'Llegaste al límite de tu plan' },
+      MP_NOT_CONNECTED:           { kind: 'warn', icon: '!', text: 'Mercado Pago no está vinculado' }
+    };
+    function resultInfo(s) { return RESULT[s] || { kind: 'warn', icon: '?', text: 'Sin resultado' }; }
+
+    // ---------- Estado ----------
+    let data = null;
+    let currentTab = 'home';
+    let showAllReceipts = false;
+    let lastCharge = null;
+
+    function switchTab(tab) {
+      currentTab = tab;
+      ['home', 'charge', 'settings', 'demo'].forEach(t => {
+        document.getElementById('tab-' + t).classList.toggle('hidden', t !== tab);
+      });
+      document.querySelectorAll('nav button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+      try { sessionStorage.setItem('tab', tab); } catch (_) {}
+    }
+    function goTo(tab, focusId) {
+      switchTab(tab);
+      const el = document.getElementById(focusId);
+      if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); el.focus({ preventScroll: true }); }
+    }
+
+    async function load() {
+      data = await api('/api/v1/dashboard');
+      render();
+    }
+
+    function render() {
+      if (!data) return;
+      const demo = !!data.demo_mode;
+      document.getElementById('demo-banner').classList.toggle('hidden', !demo);
+      document.querySelectorAll('.demo-only').forEach(el => el.classList.toggle('hidden', !demo));
+      if (!demo && currentTab === 'demo') switchTab('home');
+      document.getElementById('logout-form').classList.toggle('hidden', !data.auth_enabled);
+
+      const t = data.tenant || {};
+      document.getElementById('business-name').textContent = t.business_name || '';
+
+      const acc = data.mp_account;
+      const senders = data.senders || [];
+      const nameByPhone = {};
+      senders.forEach(s => { nameByPhone[s.phone_number] = s.employee_name; });
+
+      renderSetup(acc, senders);
+      renderHome(nameByPhone);
+      renderCharges(acc);
+      renderSettings(t, acc, senders);
+      if (demo) renderDemo(senders);
+    }
+
+    function renderSetup(acc, senders) {
+      const mpOk = !!acc;
+      const accountOk = !!(acc && (acc.expected_alias || acc.expected_cvu));
+      const sendersOk = senders.length > 0;
+      document.getElementById('step-mp').classList.toggle('done', mpOk);
+      document.getElementById('step-account').classList.toggle('done', accountOk);
+      document.getElementById('step-senders').classList.toggle('done', sendersOk);
+      document.getElementById('setup-card').classList.toggle('hidden', mpOk && accountOk && sendersOk);
+    }
+
+    function renderHome(nameByPhone) {
+      const vals = data.validations || [];
+      const pending = data.pending_queue || [];
+      let ok = 0, bad = 0;
+      vals.filter(v => isToday(v.created_at)).forEach(v => {
+        const k = resultInfo(v.validation_result).kind;
+        if (k === 'ok') ok++; else if (k === 'bad') bad++;
+      });
+      document.getElementById('kpi-ok').textContent = ok;
+      document.getElementById('kpi-bad').textContent = bad;
+      document.getElementById('kpi-wait').textContent = pending.length;
+
+      document.getElementById('pending-card').classList.toggle('hidden', pending.length === 0);
+      document.getElementById('pending-list').innerHTML = pending.map(p =>
+        '<li><span class="icon warn">⏳</span>' +
+          '<div class="main"><div class="title">' + esc(p.sender_name || 'Cliente') + '</div>' +
+          '<div class="meta">Enviado por ' + esc(p.sender_phone === 'panel' ? 'el panel' : (p.employee_name || p.sender_phone)) + ' · ' + esc(time(p.created_at)) + '</div></div>' +
+          '<div class="side amount">' + money(p.expected_amount) + '</div>' +
+        '</li>'
+      ).join('');
+
+      const shown = showAllReceipts ? vals : vals.slice(0, 8);
+      document.getElementById('receipts-more').classList.toggle('hidden', showAllReceipts || vals.length <= 8);
+      document.getElementById('receipts-list').innerHTML = shown.length === 0
+        ? '<li class="empty">Todavía no hay comprobantes. Cuando un empleado reenvíe uno por WhatsApp, aparece acá.</li>'
+        : shown.map(v => {
+            const r = resultInfo(v.validation_result);
+            const who = v.extracted_sender_name || 'Cliente sin nombre';
+            const by = v.sender_phone === 'panel' ? 'el panel' : (nameByPhone[v.sender_phone] || '+' + v.sender_phone);
+            return '<li><span class="icon ' + r.kind + '">' + r.icon + '</span>' +
+              '<div class="main"><div class="title">' + esc(who) + '</div>' +
+              '<div class="meta">' + esc(when(v.created_at)) + ' · enviado por ' + esc(by) + '</div></div>' +
+              '<div class="side"><div class="amount">' + money(v.extracted_amount) + '</div>' +
+              '<span class="tag ' + r.kind + '">' + esc(r.text) + '</span></div>' +
+            '</li>';
+          }).join('');
+
+      const payments = data.payments || [];
+      document.getElementById('payments-list').innerHTML = payments.length === 0
+        ? '<li class="empty">Todavía no entraron pagos.</li>'
+        : payments.slice(0, 20).map(p => {
+            const used = p.reconciliation_status === 'CONSUMED';
+            return '<li><span class="icon info">$</span>' +
+              '<div class="main"><div class="title">' + esc(p.payer_name || 'Pagador sin nombre') + '</div>' +
+              '<div class="meta">' + esc(when(p.payment_date)) + '</div></div>' +
+              '<div class="side"><div class="amount">' + money(p.amount) + '</div>' +
+              (used ? '<span class="tag ok">Con comprobante</span>' : '<span class="tag muted">Sin comprobante</span>') + '</div>' +
+            '</li>';
+          }).join('');
+    }
+
+    function renderCharges(acc) {
+      const orders = (data.charge_orders || []).slice().sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      document.getElementById('charges-list').innerHTML = orders.length === 0
+        ? '<li class="empty">No generaste cobros todavía. También podés usar <b>/cobrar 15000</b> desde WhatsApp.</li>'
+        : orders.map(o => {
+            const paid = o.status === 'PAID';
+            return '<li><span class="icon ' + (paid ? 'ok' : 'warn') + '">' + (paid ? '✓' : '⏳') + '</span>' +
+              '<div class="main"><div class="title">' + esc(o.reference || 'Cobro') + '</div>' +
+              '<div class="meta">' + esc(time(o.created_at)) + '</div></div>' +
+              '<div class="side"><div class="amount">' + money(o.unique_amount) + '</div>' +
+              '<span class="tag ' + (paid ? 'ok' : 'warn') + '">' + (paid ? 'Pagado' : 'Esperando') + '</span></div>' +
+            '</li>';
+          }).join('');
+    }
+
+    function renderSettings(t, acc, senders) {
+      const st = document.getElementById('mp-status-text');
+      const btn = document.getElementById('mp-connect-btn');
+      if (acc) {
+        st.textContent = '✓ Vinculado (usuario ' + acc.mp_user_id + ').';
+        btn.textContent = 'Volver a vincular';
+      } else {
+        st.textContent = 'No vinculado. Sin esto no podemos confirmar los pagos.';
+        btn.textContent = 'Vincular Mercado Pago';
+      }
+
+      const aliasIn = document.getElementById('account-alias');
+      const cvuIn = document.getElementById('account-cvu');
+      if (acc && document.activeElement !== aliasIn && document.activeElement !== cvuIn) {
+        aliasIn.value = acc.expected_alias || '';
+        cvuIn.value = acc.expected_cvu || '';
+      }
+      aliasIn.disabled = cvuIn.disabled = !acc;
+
+      const ROLE = { OWNER: 'Dueño/a', CASHIER: 'Cajero/a', DELIVERY: 'Repartidor/a' };
+      document.getElementById('senders-list').innerHTML = senders.length === 0
+        ? '<li class="empty">Todavía no agregaste a nadie.</li>'
+        : senders.map(s =>
+            '<li><span class="icon info">' + esc((s.employee_name || '?').charAt(0).toUpperCase()) + '</span>' +
+              '<div class="main"><div class="title">' + esc(s.employee_name) + '</div>' +
+              '<div class="meta">+' + esc(s.phone_number) + ' · ' + esc(ROLE[s.role] || s.role) + '</div></div>' +
+              '<button class="btn link" data-id="' + esc(s.id) + '" data-name="' + esc(s.employee_name) + '" onclick="deleteSender(this.dataset.id, this.dataset.name)">Quitar</button>' +
+            '</li>'
+          ).join('');
+
+      const used = t.used_quota || 0;
+      const quota = t.monthly_quota || 0;
+      const pct = quota ? Math.min(100, Math.round(used / quota * 100)) : 0;
+      const plans = data.plans || {};
+      const planName = (plans[t.plan_type] && plans[t.plan_type].name) || t.plan_type || '';
+      document.getElementById('quota-text').textContent =
+        'Plan ' + planName + ': usaste ' + used + ' de ' + quota + ' comprobantes este mes.';
+      document.getElementById('quota-bar').style.width = pct + '%';
+
+      const planSel = document.getElementById('settings-plan');
+      if (document.activeElement !== planSel) {
+        planSel.innerHTML = Object.values(plans)
+          .sort((a, b) => a.monthly_quota - b.monthly_quota)
+          .map(p => '<option value="' + esc(p.plan) + '"' + (p.plan === t.plan_type ? ' selected' : '') + '>' +
+            esc(p.name) + ' — ' + p.monthly_quota + ' comprobantes/mes</option>').join('');
+      }
+      const winIn = document.getElementById('settings-window');
+      if (document.activeElement !== winIn) winIn.value = t.time_window_minutes || 120;
+
+      const sys = data.system || {};
+      const parts = [
+        'Base de datos: ' + (sys.mysql_connected ? 'conectada' : 'en memoria (se borra al reiniciar)'),
+        'Cola de espera: ' + (sys.redis_connected ? 'conectada' : 'en memoria'),
+        'Lectura de comprobantes: ' + (sys.gemini_live_key ? 'activa' : 'sin configurar')
+      ];
+      document.getElementById('system-status').textContent = parts.join(' · ');
+    }
+
+    function renderDemo(senders) {
+      const sel = document.getElementById('sim-sender');
+      const cur = sel.value;
+      sel.innerHTML = senders.map(s => '<option value="' + esc(s.phone_number) + '">' + esc(s.employee_name) + '</option>').join('');
+      if (cur) sel.value = cur;
+
+      const msgs = data.wa_messages || [];
+      const chat = document.getElementById('chat');
+      chat.innerHTML = msgs.length === 0
+        ? '<div class="empty">Todavía no hay mensajes.</div>'
+        : msgs.map(m => {
+            const out = m.direction === 'OUTBOUND';
+            return '<div class="bubble' + (out ? ' out' : '') + '"><div class="who">' + esc(out ? 'Bot' : m.sender) + '</div>' + waText(m.body) + '</div>';
+          }).join('');
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    function showResult(boxId, outcome) {
+      const r = resultInfo(outcome.status);
+      const box = document.getElementById(boxId);
+      box.className = 'result ' + r.kind;
+      box.innerHTML = '<div class="r-title">' + r.icon + ' ' + esc(r.text) + '</div>' +
+        (outcome.message_for_user ? '<div>' + waText(outcome.message_for_user) + '</div>' : '');
+    }
+
+    // ---------- Acciones ----------
+    async function uploadReceipt(e) {
+      e.preventDefault();
+      const input = document.getElementById('receipt-file');
+      if (!input.files.length) return;
+      const btn = document.getElementById('upload-btn');
+      btn.disabled = true; btn.textContent = 'Verificando…';
+      const box = document.getElementById('upload-result');
+      box.className = 'result warn';
+      box.innerHTML = '<div class="r-title">Analizando el comprobante…</div><div>Puede tardar hasta un minuto. No cierres la página.</div>';
+      try {
+        const fd = new FormData();
+        fd.append('receipt_file', input.files[0]);
+        const job = await api('/api/v1/receipts/upload', { method: 'POST', body: fd });
+        const outcome = await waitForUpload(job.job_id);
+        showResult('upload-result', outcome);
+        input.value = '';
+        await load();
+      } catch (_) {
+        box.className = 'result hidden';
+      } finally {
+        btn.disabled = false; btn.textContent = 'Verificar';
+      }
+    }
+
+    // El análisis corre en el servidor; consultamos cada 2 segundos hasta tener el resultado.
+    async function waitForUpload(jobId) {
+      const deadline = Date.now() + 3 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 2000));
+        const job = await api('/api/v1/receipts/upload?job=' + encodeURIComponent(jobId));
+        if (job.status === 'done') return job.outcome;
+        if (job.status === 'error') { showError(job.error); throw new Error(job.error); }
+      }
+      const msg = 'El análisis está tardando demasiado. Revisá en unos minutos la lista de últimos comprobantes.';
+      showError(msg);
+      throw new Error(msg);
+    }
+
+    async function createCharge(e) {
+      e.preventDefault();
+      const order = await postJSON('/api/v1/posnet/charge', {
+        base_amount: parseFloat(document.getElementById('charge-amount').value),
+        reference: document.getElementById('charge-ref').value.trim()
+      });
+      lastCharge = order;
+      document.getElementById('charge-value').textContent = money(order.unique_amount);
+      document.getElementById('charge-alias').textContent = order.alias_or_cvu || 'tu cuenta';
+      document.getElementById('charge-result').classList.remove('hidden');
+      document.getElementById('charge-ref').value = '';
+      await load();
+    }
+
+    async function copyAmount() {
+      if (!lastCharge) return;
+      try {
+        await navigator.clipboard.writeText(Number(lastCharge.unique_amount).toFixed(2).replace('.', ','));
+        toast('Monto copiado');
+      } catch (_) { toast('No se pudo copiar'); }
+    }
+
+    async function saveAccount(e) {
+      e.preventDefault();
+      await postJSON('/api/v1/account', {
+        expected_alias: document.getElementById('account-alias').value.trim().toLowerCase(),
+        expected_cvu: document.getElementById('account-cvu').value.replace(/\D/g, '')
+      });
+      toast('Cuenta guardada');
+      await load();
+    }
+
+    async function addSender(e) {
+      e.preventDefault();
+      await postJSON('/api/v1/senders', {
+        employee_name: document.getElementById('new-sender-name').value.trim(),
+        phone_number: document.getElementById('new-sender-phone').value,
+        role: document.getElementById('new-sender-role').value
+      });
+      document.getElementById('new-sender-name').value = '';
+      document.getElementById('new-sender-phone').value = '';
+      toast('Persona agregada');
+      await load();
+    }
+
+    async function deleteSender(id, name) {
+      if (!confirm('¿Quitar a ' + name + '? Ya no va a poder enviar comprobantes.')) return;
+      await api('/api/v1/senders?id=' + encodeURIComponent(id), { method: 'DELETE' });
+      toast('Persona quitada');
+      await load();
+    }
+
+    async function savePlan(e) {
+      e.preventDefault();
+      await postJSON('/api/v1/plan', {
+        plan: document.getElementById('settings-plan').value,
+        time_window_minutes: parseInt(document.getElementById('settings-window').value, 10)
+      });
+      toast('Guardado');
+      await load();
+    }
+
+    // Solo modo demo
+    async function runScenario(scenario) {
+      const outcome = await postJSON('/api/v1/simulate/receipt', {
+        scenario, sender_phone: document.getElementById('sim-sender').value
+      });
+      showResult('demo-result', outcome);
+      await load();
+    }
+    async function simulatePayment(amount) {
+      const body = amount ? { amount: Number(amount), payer_name: 'Cliente de prueba' } : {};
+      await postJSON('/api/v1/simulate/mp-webhook', body);
+      toast('Pago simulado');
+      await load();
+    }
+    async function sendCommand(e) {
+      e.preventDefault();
+      const input = document.getElementById('chat-input');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      await postJSON('/api/v1/simulate/whatsapp-command', { text, sender_phone: document.getElementById('sim-sender').value });
+      await load();
+    }
+
+    // ---------- Inicio ----------
+    (function init() {
+      const params = new URLSearchParams(location.search);
+      if (params.get('oauth') === 'connected') {
+        document.getElementById('oauth-banner').classList.remove('hidden');
+        history.replaceState(null, '', '/');
+      }
+      let saved = null;
+      try { saved = sessionStorage.getItem('tab'); } catch (_) {}
+      if (saved && document.getElementById('tab-' + saved)) switchTab(saved);
+      load().catch(() => {});
+      // Refresco automático para ver los comprobantes nuevos sin recargar
+      setInterval(() => { if (!document.hidden) load().catch(() => {}); }, 15000);
+    })();
+  </script>
+</body>
+</html>
