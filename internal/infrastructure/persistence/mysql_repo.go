@@ -22,11 +22,6 @@ var (
 	ErrPaymentAmountMismatch  = domain.ErrPaymentAmountMismatch
 )
 
-const (
-	DefaultDemoTenantID    = "11111111-2222-3333-4444-555555555555"
-	DefaultDemoMPAccountID = "22222222-3333-4444-5555-666666666666"
-)
-
 var _ domain.Repository = (*MySQLRepository)(nil)
 
 // verifiedStatusesSQL son los resultados que "usan" un archivo: solo esos cuentan como archivo repetido.
@@ -78,6 +73,7 @@ type inMemoryStore struct {
 	senders      map[string]*domain.AuthorizedSender
 	payments     map[string]*domain.MPPayment // key: tenantID + ":" + mpPaymentID
 	validations  []*domain.ReceiptValidation
+	customers    map[string]*domain.Customer // key: tenantID + "|" + identity_key
 }
 
 func newInMemoryStore() *inMemoryStore {
@@ -88,6 +84,7 @@ func newInMemoryStore() *inMemoryStore {
 		senders:      make(map[string]*domain.AuthorizedSender),
 		payments:     make(map[string]*domain.MPPayment),
 		validations:  make([]*domain.ReceiptValidation, 0),
+		customers:    make(map[string]*domain.Customer),
 	}
 }
 
@@ -182,6 +179,74 @@ func (r *MySQLRepository) FindVerifiedByReceiptID(ctx context.Context, tenantID 
 	return true, createdAt, nil
 }
 
+// ListRecentVerifiedByAmount devuelve las validaciones verificadas por ese monto desde "since",
+// con la hora y el CUIT del pago de MP que se les asignó.
+func (r *MySQLRepository) ListRecentVerifiedByAmount(ctx context.Context, tenantID string, amount float64, since time.Time) ([]domain.VerifiedReceiptRef, error) {
+	if amount <= 0 {
+		return nil, nil
+	}
+	if r.db == nil {
+		r.mem.mu.Lock()
+		defer r.mem.mu.Unlock()
+		var out []domain.VerifiedReceiptRef
+		for _, v := range r.mem.validations {
+			if v.TenantID != tenantID || !isVerifiedStatus(v.ValidationResult) ||
+				!domain.SameAmount(v.ExtractedAmount, amount) || v.CreatedAt.Before(since) {
+				continue
+			}
+			ref := domain.VerifiedReceiptRef{
+				ValidatedAt: v.CreatedAt,
+				SenderCUIT:  v.ExtractedSenderCUIT,
+				SenderName:  v.ExtractedSenderName,
+				ReceiptTime: v.ExtractedDate,
+			}
+			for _, p := range r.mem.payments {
+				if v.MatchedMPPaymentID != "" && p.ID == v.MatchedMPPaymentID {
+					d := p.PaymentDate
+					ref.PaymentDate = &d
+					ref.PayerCUIT = p.PayerCUIT
+					break
+				}
+			}
+			out = append(out, ref)
+		}
+		return out, nil
+	}
+
+	query := `SELECT v.created_at, COALESCE(v.extracted_sender_cuit, ''), COALESCE(v.extracted_sender_name, ''),
+			v.extracted_date, p.payment_date, COALESCE(p.payer_cuit, '')
+		FROM receipt_validations v
+		LEFT JOIN mp_payments p ON p.id = v.matched_mp_payment_id
+		WHERE v.tenant_id = ? AND v.extracted_amount = CAST(? AS DECIMAL(15,2))
+		  AND v.validation_result IN (` + verifiedStatusesSQL + `)
+		  AND v.created_at >= ?
+		ORDER BY v.created_at DESC
+		LIMIT 50`
+	rows, err := r.db.QueryContext(ctx, query, tenantID, strconv.FormatFloat(amount, 'f', 2, 64), since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.VerifiedReceiptRef
+	for rows.Next() {
+		var ref domain.VerifiedReceiptRef
+		var receiptTime, paymentDate sql.NullTime
+		if err := rows.Scan(&ref.ValidatedAt, &ref.SenderCUIT, &ref.SenderName, &receiptTime, &paymentDate, &ref.PayerCUIT); err != nil {
+			return nil, err
+		}
+		if receiptTime.Valid {
+			t := receiptTime.Time
+			ref.ReceiptTime = &t
+		}
+		if paymentDate.Valid {
+			t := paymentDate.Time
+			ref.PaymentDate = &t
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
 // ExistsValidationByWAMessageID evita procesar dos veces el mismo mensaje cuando Meta reenvía el webhook.
 func (r *MySQLRepository) ExistsValidationByWAMessageID(ctx context.Context, waMessageID string) (bool, error) {
 	if waMessageID == "" {
@@ -223,6 +288,17 @@ func (r *MySQLRepository) UpsertMPPayment(ctx context.Context, p *domain.MPPayme
 		p.RawJSON, _ = json.Marshal(p)
 	}
 
+	// Cruce: el pagador que informa Mercado Pago queda asociado a su cliente
+	if p.CustomerID == "" {
+		c, err := r.UpsertCustomer(ctx, p.TenantID, p.PayerCUIT, p.PayerName, p.PayerEmail, p.PaymentDate)
+		if err != nil {
+			return err
+		}
+		if c != nil {
+			p.CustomerID = c.ID
+		}
+	}
+
 	if r.db == nil {
 		r.mem.mu.Lock()
 		defer r.mem.mu.Unlock()
@@ -235,8 +311,14 @@ func (r *MySQLRepository) UpsertMPPayment(ctx context.Context, p *domain.MPPayme
 			if p.PayerName != "" {
 				existing.PayerName = p.PayerName
 			}
+			if p.PayerEmail != "" {
+				existing.PayerEmail = p.PayerEmail
+			}
 			if p.CoelsaID != "" {
 				existing.CoelsaID = p.CoelsaID
+			}
+			if existing.CustomerID == "" {
+				existing.CustomerID = p.CustomerID
 			}
 			return nil
 		}
@@ -253,18 +335,20 @@ func (r *MySQLRepository) UpsertMPPayment(ctx context.Context, p *domain.MPPayme
 
 	query := `
 		INSERT INTO mp_payments (
-			id, tenant_id, mp_payment_id, amount, currency, mp_status,
-			operation_type, payer_cuit, payer_name, coelsa_id, payment_date,
+			id, tenant_id, customer_id, mp_payment_id, amount, currency, mp_status,
+			operation_type, payer_cuit, payer_name, payer_email, coelsa_id, payment_date,
 			reconciliation_status, raw_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE', ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'AVAILABLE', ?)
 		ON DUPLICATE KEY UPDATE
 			mp_status = VALUES(mp_status),
 			payer_cuit = COALESCE(NULLIF(VALUES(payer_cuit), ''), payer_cuit),
-			coelsa_id = COALESCE(NULLIF(VALUES(coelsa_id), ''), coelsa_id)
+			payer_email = COALESCE(NULLIF(VALUES(payer_email), ''), payer_email),
+			coelsa_id = COALESCE(NULLIF(VALUES(coelsa_id), ''), coelsa_id),
+			customer_id = COALESCE(customer_id, VALUES(customer_id))
 	`
 	_, err := r.db.ExecContext(ctx, query,
-		p.ID, p.TenantID, p.MPPaymentID, p.Amount, p.Currency, p.MPStatus,
-		p.OperationType, p.PayerCUIT, p.PayerName, p.CoelsaID, p.PaymentDate,
+		p.ID, p.TenantID, nullIfEmpty(p.CustomerID), p.MPPaymentID, p.Amount, p.Currency, p.MPStatus,
+		p.OperationType, p.PayerCUIT, p.PayerName, nullIfEmpty(p.PayerEmail), p.CoelsaID, p.PaymentDate,
 		string(p.RawJSON),
 	)
 	return err
@@ -531,16 +615,16 @@ func (r *MySQLRepository) SaveReceiptValidation(ctx context.Context, v *domain.R
 
 	query := `
 		INSERT INTO receipt_validations (
-			id, tenant_id, sender_phone, wa_message_id, file_sha256,
+			id, tenant_id, customer_id, sender_phone, wa_message_id, file_sha256,
 			extracted_amount, extracted_op_number, extracted_coelsa_id,
 			extracted_date, extracted_sender_name, extracted_sender_cuit,
 			extracted_receiver_alias_or_cbu, extracted_source_bank,
 			ai_fraud_warnings, validation_result, matched_mp_payment_id,
 			processing_time_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 	_, err := r.db.ExecContext(ctx, query,
-		v.ID, v.TenantID, v.SenderPhone, v.WAMessageID, v.FileSHA256,
+		v.ID, v.TenantID, nullIfEmpty(v.CustomerID), v.SenderPhone, v.WAMessageID, v.FileSHA256,
 		v.ExtractedAmount, v.ExtractedOpNumber, v.ExtractedCoelsaID,
 		v.ExtractedDate, v.ExtractedSenderName, v.ExtractedSenderCUIT,
 		v.ExtractedReceiverAliasOrCBU, v.ExtractedSourceBank,
@@ -588,7 +672,7 @@ func (r *MySQLRepository) GetTenantByID(ctx context.Context, tenantID string) (*
 	var planStr string
 	var period sql.NullString
 	query := `
-		SELECT id, business_name, cuit, email, password_hash, plan_type,
+		SELECT id, business_name, COALESCE(cuit, ''), COALESCE(email, ''), COALESCE(password_hash, ''), plan_type,
 		       monthly_quota, used_quota, quota_period, time_window_minutes, is_active,
 		       created_at, updated_at
 		FROM tenants WHERE id = ?
@@ -924,19 +1008,8 @@ func (r *MySQLRepository) ListReceiptValidations(ctx context.Context, tenantID s
 		return list, nil
 	}
 
-	query := `
-		SELECT id, tenant_id, sender_phone, wa_message_id, file_sha256,
-		       COALESCE(extracted_amount, 0), COALESCE(extracted_op_number, ''),
-		       COALESCE(extracted_coelsa_id, ''), extracted_date,
-		       COALESCE(extracted_sender_name, ''), COALESCE(extracted_sender_cuit, ''),
-		       COALESCE(extracted_receiver_alias_or_cbu, ''), COALESCE(extracted_source_bank, ''),
-		       ai_fraud_warnings, validation_result, COALESCE(matched_mp_payment_id, ''),
-		       COALESCE(processing_time_ms, 0), created_at
-		FROM receipt_validations
-		WHERE tenant_id = ?
-		ORDER BY created_at DESC
-		LIMIT ?
-	`
+	query := `SELECT ` + validationColumns + ` FROM receipt_validations
+		WHERE tenant_id = ? ORDER BY created_at DESC LIMIT ?`
 	rows, err := r.db.QueryContext(ctx, query, tenantID, limit)
 	if err != nil {
 		return nil, err
@@ -945,29 +1018,11 @@ func (r *MySQLRepository) ListReceiptValidations(ctx context.Context, tenantID s
 
 	var list []*domain.ReceiptValidation
 	for rows.Next() {
-		var v domain.ReceiptValidation
-		var extDate sql.NullTime
-		var warningsRaw []byte
-		var statusStr string
-		if err := rows.Scan(
-			&v.ID, &v.TenantID, &v.SenderPhone, &v.WAMessageID, &v.FileSHA256,
-			&v.ExtractedAmount, &v.ExtractedOpNumber, &v.ExtractedCoelsaID, &extDate,
-			&v.ExtractedSenderName, &v.ExtractedSenderCUIT,
-			&v.ExtractedReceiverAliasOrCBU, &v.ExtractedSourceBank,
-			&warningsRaw, &statusStr, &v.MatchedMPPaymentID,
-			&v.ProcessingTimeMs, &v.CreatedAt,
-		); err != nil {
+		v, err := scanValidation(rows)
+		if err != nil {
 			return nil, err
 		}
-		if extDate.Valid {
-			t := extDate.Time
-			v.ExtractedDate = &t
-		}
-		if len(warningsRaw) > 0 {
-			_ = json.Unmarshal(warningsRaw, &v.AIFraudWarnings)
-		}
-		v.ValidationResult = domain.ValidationStatus(statusStr)
-		list = append(list, &v)
+		list = append(list, v)
 	}
 	return list, rows.Err()
 }
@@ -996,13 +1051,15 @@ func (r *MySQLRepository) ListMPPayments(ctx context.Context, tenantID string, l
 	}
 
 	query := `
-		SELECT id, tenant_id, mp_payment_id, amount, currency, mp_status,
-		       COALESCE(operation_type, ''), COALESCE(payer_cuit, ''), COALESCE(payer_name, ''),
-		       COALESCE(coelsa_id, ''), payment_date, reconciliation_status,
-		       consumed_at, COALESCE(consumed_by_receipt_id, ''), created_at
-		FROM mp_payments
-		WHERE tenant_id = ?
-		ORDER BY payment_date DESC
+		SELECT p.id, p.tenant_id, p.mp_payment_id, p.amount, p.currency, p.mp_status,
+		       COALESCE(p.operation_type, ''), COALESCE(p.payer_cuit, ''),
+		       COALESCE(NULLIF(p.payer_name, ''), c.name, ''), COALESCE(p.payer_email, ''),
+		       COALESCE(p.customer_id, ''), COALESCE(p.coelsa_id, ''), p.payment_date, p.reconciliation_status,
+		       p.consumed_at, COALESCE(p.consumed_by_receipt_id, ''), p.created_at
+		FROM mp_payments p
+		LEFT JOIN customers c ON c.id = p.customer_id
+		WHERE p.tenant_id = ?
+		ORDER BY p.payment_date DESC
 		LIMIT ?
 	`
 	rows, err := r.db.QueryContext(ctx, query, tenantID, limit)
@@ -1017,7 +1074,7 @@ func (r *MySQLRepository) ListMPPayments(ctx context.Context, tenantID string, l
 		var consumedAt sql.NullTime
 		if err := rows.Scan(
 			&p.ID, &p.TenantID, &p.MPPaymentID, &p.Amount, &p.Currency, &p.MPStatus,
-			&p.OperationType, &p.PayerCUIT, &p.PayerName, &p.CoelsaID,
+			&p.OperationType, &p.PayerCUIT, &p.PayerName, &p.PayerEmail, &p.CustomerID, &p.CoelsaID,
 			&p.PaymentDate, &p.ReconciliationStatus, &consumedAt, &p.ConsumedByReceiptID, &p.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -1029,151 +1086,6 @@ func (r *MySQLRepository) ListMPPayments(ctx context.Context, tenantID string, l
 		list = append(list, &p)
 	}
 	return list, rows.Err()
-}
-
-// SeedDefaultDemoData inicializa un comercio de demostración, cuenta MP vinculada (con tokens encriptados AES-256-GCM),
-// números de WhatsApp de empleados y pagos acreditados reales listos para probar conciliación en 1 clic.
-func (r *MySQLRepository) SeedDefaultDemoData(ctx context.Context, encryptedAccessToken, encryptedRefreshToken, webhookSecret string) error {
-	now := time.Now()
-	demoTenant := &domain.Tenant{
-		ID:                DefaultDemoTenantID,
-		BusinessName:      "Pizzería & Empanadas Don Mateo SRL",
-		CUIT:              "30716492819",
-		Email:             "admin@donmateo.com.ar",
-		PasswordHash:      "$2a$10$veripagodemo",
-		PlanType:          domain.PlanPro,
-		MonthlyQuota:      1500,
-		UsedQuota:         14,
-		TimeWindowMinutes: 120,
-		IsActive:          true,
-		CreatedAt:         now.Add(-72 * time.Hour),
-		UpdatedAt:         now,
-	}
-
-	demoAccount := &domain.MPAccount{
-		ID:                 DefaultDemoMPAccountID,
-		TenantID:           DefaultDemoTenantID,
-		MPUserID:           1492837465,
-		ExpectedAlias:      "don.mateo.mp",
-		ExpectedCVU:        "0000003100084920194821",
-		ExpectedHolderName: "Pizzeria Don Mateo SRL",
-		AccessTokenEnc:     encryptedAccessToken,
-		RefreshTokenEnc:    encryptedRefreshToken,
-		TokenExpiresAt:     now.Add(6 * time.Hour),
-		WebhookSecret:      webhookSecret,
-		Status:             "CONNECTED",
-		CreatedAt:          now.Add(-72 * time.Hour),
-		UpdatedAt:          now,
-	}
-
-	demoSenders := []*domain.AuthorizedSender{
-		{
-			ID:           "sender-owner-01",
-			TenantID:     DefaultDemoTenantID,
-			PhoneNumber:  "5491155001111",
-			EmployeeName: "Mateo Rossi (Dueño)",
-			Role:         domain.RoleOwner,
-			IsActive:     true,
-			CreatedAt:    now.Add(-48 * time.Hour),
-		},
-		{
-			ID:           "sender-cashier-01",
-			TenantID:     DefaultDemoTenantID,
-			PhoneNumber:  "5491155002222",
-			EmployeeName: "Lucía Gómez (Cajera Mostrador)",
-			Role:         domain.RoleCashier,
-			IsActive:     true,
-			CreatedAt:    now.Add(-36 * time.Hour),
-		},
-		{
-			ID:           "sender-delivery-01",
-			TenantID:     DefaultDemoTenantID,
-			PhoneNumber:  "5491155003333",
-			EmployeeName: "Nahuel Pereyra (Repartidor Moto 1)",
-			Role:         domain.RoleDelivery,
-			IsActive:     true,
-			CreatedAt:    now.Add(-24 * time.Hour),
-		},
-	}
-
-	demoPayments := []*domain.MPPayment{
-		{
-			ID:                   "pay-uuid-88492019482",
-			TenantID:             DefaultDemoTenantID,
-			MPPaymentID:          88492019482,
-			Amount:               15450.50,
-			Currency:             "ARS",
-			MPStatus:             "approved",
-			OperationType:        "money_transfer",
-			PayerCUIT:            "20348912349",
-			PayerName:            "Juan Ignacio Perez",
-			CoelsaID:             "2410200000149281746391",
-			PaymentDate:          now.Add(-5 * time.Minute),
-			ReconciliationStatus: "AVAILABLE",
-			CreatedAt:            now.Add(-5 * time.Minute),
-		},
-		{
-			ID:                   "pay-uuid-88492019999",
-			TenantID:             DefaultDemoTenantID,
-			MPPaymentID:          88492019999,
-			Amount:               24800.00,
-			Currency:             "ARS",
-			MPStatus:             "approved",
-			OperationType:        "bank_transfer",
-			PayerCUIT:            "27319482714",
-			PayerName:            "Maria Florencia Sosa",
-			CoelsaID:             "2410200000998877665544",
-			PaymentDate:          now.Add(-8 * time.Minute),
-			ReconciliationStatus: "AVAILABLE",
-			CreatedAt:            now.Add(-8 * time.Minute),
-		},
-	}
-
-	if r.db == nil {
-		r.mem.mu.Lock()
-		r.mem.tenants[demoTenant.ID] = demoTenant
-		r.mem.mpAccounts[demoTenant.ID] = demoAccount
-		for _, s := range demoSenders {
-			r.mem.senders[s.ID] = s
-		}
-		r.mem.mu.Unlock()
-		for _, p := range demoPayments {
-			_ = r.UpsertMPPayment(ctx, p)
-		}
-		return nil
-	}
-
-	// Si MySQL está activo, insertamos con INSERT IGNORE para no pisar datos previos
-	_, _ = r.db.ExecContext(ctx, `
-		INSERT IGNORE INTO tenants (id, business_name, cuit, email, password_hash, plan_type, monthly_quota, used_quota, time_window_minutes, is_active)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
-	`, demoTenant.ID, demoTenant.BusinessName, demoTenant.CUIT, demoTenant.Email, demoTenant.PasswordHash, string(demoTenant.PlanType), demoTenant.MonthlyQuota, demoTenant.UsedQuota, demoTenant.TimeWindowMinutes)
-
-	_ = r.UpsertMPAccount(ctx, demoAccount)
-	for _, s := range demoSenders {
-		_ = r.CreateAuthorizedSender(ctx, s)
-	}
-	for _, p := range demoPayments {
-		_ = r.UpsertMPPayment(ctx, p)
-	}
-	return nil
-}
-
-// RevokeDemoMPAccount desactiva la cuenta MP de demostración sembrada en arranques anteriores,
-// para que nunca tape a la cuenta real vinculada por OAuth.
-func (r *MySQLRepository) RevokeDemoMPAccount(ctx context.Context) error {
-	if r.db == nil {
-		r.mem.mu.Lock()
-		defer r.mem.mu.Unlock()
-		for k, acc := range r.mem.mpAccounts {
-			if acc.ID == DefaultDemoMPAccountID {
-				delete(r.mem.mpAccounts, k)
-			}
-		}
-		return nil
-	}
-	_, err := r.db.ExecContext(ctx, `UPDATE mp_accounts SET status = 'REVOKED' WHERE id = ? AND status <> 'REVOKED'`, DefaultDemoMPAccountID)
-	return err
 }
 
 func normalizePhone(p string) string {

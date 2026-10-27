@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io/fs"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -117,15 +119,13 @@ func newTestEnv(t *testing.T, demo bool, adminPassword string) *testEnv {
 		t.Fatal(err)
 	}
 	repo := persistence.NewMySQLRepository(nil)
-	encAcc, _ := vault.Encrypt("DEMO_TOKEN")
-	encRef, _ := vault.Encrypt("DEMO_REFRESH")
-	_ = repo.SeedDefaultDemoData(context.Background(), encAcc, encRef, cfg.MPWebhookSecret)
+	tenant := seedTestFixtures(t, repo, vault, cfg.MPWebhookSecret)
 
 	extractor, _ := ai.NewGeminiReceiptExtractor(context.Background(), "", "", demo)
 	mpClient := mp.NewMPClient(demo)
 	waClient := whatsapp.NewClient("", "")
 	verifyUC := application.NewVerifyReceiptUseCase(repo, extractor, mpClient)
-	h := NewWebhooksHandler(cfg, repo, vault, extractor, mpClient, waClient, queue.NewRedisQueueStore("", "", 0), verifyUC)
+	h := NewWebhooksHandler(cfg, repo, vault, extractor, mpClient, waClient, queue.NewRedisQueueStore("", "", 0), verifyUC, tenant.ID)
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 	return &testEnv{cfg: cfg, handler: h, mux: mux, waLog: waClient}
@@ -272,7 +272,7 @@ func TestEndToEndHTTPFlow(t *testing.T) {
 	}
 
 	// 3. Orden /cobrar: el pago exacto la marca pagada y avisa al empleado que la pidió
-	tenant, _ := env.handler.repo.GetTenantByID(context.Background(), persistence.DefaultDemoTenantID)
+	tenant, _ := env.handler.repo.GetTenantByID(context.Background(), env.handler.tenantID)
 	senders, _ := env.handler.repo.ListAuthorizedSenders(context.Background(), tenant.ID)
 	order := env.handler.handleCobrarCommand(context.Background(), tenant, senders[1], "/cobrar 10000 Mesa 4")
 	if order == nil {
@@ -305,8 +305,8 @@ func TestLoginFlow(t *testing.T) {
 	env := newTestEnv(t, false, "una-clave-larga-123")
 
 	// La página de login es pública
-	if rec := env.do(http.MethodGet, "/login", "", false); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Ingresar") {
-		t.Fatalf("GET /login: esperaba 200 con el formulario, obtuvo %d", rec.Code)
+	if rec := env.do(http.MethodGet, "/login", "", false); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<app-root>") {
+		t.Fatalf("GET /login: esperaba 200 con la app del panel, obtuvo %d", rec.Code)
 	}
 
 	// Contraseña incorrecta: vuelve al login con error y sin cookie
@@ -498,5 +498,246 @@ func TestWhatsAppRepliesAreOneOfFour(t *testing.T) {
 	}
 	if got := formatARS(999); got != "$ 999,00" {
 		t.Errorf("formatARS: %q", got)
+	}
+
+	// Cuando la transferencia es correcta e incluye datos del cliente, banco y hora de llegada, se muestran:
+	payTime := time.Date(2026, 10, 26, 20, 45, 0, 0, time.Local)
+	verified := &domain.VerificationOutcome{
+		Status: domain.StatusVerifiedExactID,
+		ExtractedData: &domain.ExtractedReceiptData{
+			Amount:             18500,
+			SenderName:         "Carlos Alberto Gomez",
+			SourceBankOrWallet: "Banco Galicia",
+		},
+		MatchedPayment: &domain.MPPayment{
+			Amount:      18500,
+			PaymentDate: payTime,
+		},
+	}
+	gotVerified := replyForOutcome(verified)
+	for _, expectedPart := range []string{
+		"✅ Transferencia *correcta* — $ 18.500,00",
+		"👤 Cliente: Carlos Alberto Gomez",
+		"🏦 Banco: Banco Galicia",
+		"🕒 Hora: 20:45 hs",
+	} {
+		if !strings.Contains(gotVerified, expectedPart) {
+			t.Errorf("respuesta verificada %q no contiene %q", gotVerified, expectedPart)
+		}
+	}
+}
+
+func TestAlreadySentReply(t *testing.T) {
+	at := time.Date(2026, 10, 26, 20, 56, 0, 0, time.Local)
+	data := &domain.ExtractedReceiptData{Amount: 500}
+	got := replyForOutcome(&domain.VerificationOutcome{Status: domain.StatusFraudDuplicateFile, ExtractedData: data, AlreadySentAt: &at})
+	for _, part := range []string{"🔁 Comprobante *ya enviado* — $ 500,00", "ya se envió y se validó el 26/10 a las 20:56 hs"} {
+		if !strings.Contains(got, part) {
+			t.Errorf("respuesta %q no contiene %q", got, part)
+		}
+	}
+	if strings.Contains(got, "reenvialo") {
+		t.Error("sin coincidencia solo por emisor no hace falta la aclaración")
+	}
+	got = replyForOutcome(&domain.VerificationOutcome{Status: domain.StatusFraudDuplicateFile, ExtractedData: data, AlreadySentAt: &at, AlreadySentBySender: true})
+	if !strings.Contains(got, "reenvialo cuando se acredite") {
+		t.Errorf("falta la aclaración para otra transferencia: %q", got)
+	}
+}
+
+// El panel de Angular: los archivos estáticos son públicos, las páginas piden sesión.
+func TestPanelServing(t *testing.T) {
+	env := newTestEnv(t, false, "una-clave-larga-123")
+	entries, err := fs.ReadDir(panelFS, ".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var js string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".js") {
+			js = e.Name()
+			break
+		}
+	}
+	if js == "" {
+		t.Fatal("el panel no está compilado (falta correr npm run build en web/)")
+	}
+	if rec := env.do(http.MethodGet, "/"+js, "", false); rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Cache-Control"), "immutable") {
+		t.Fatalf("GET /%s sin sesión: esperaba 200 cacheable, obtuvo %d", js, rec.Code)
+	}
+	for _, page := range []string{"/", "/cobrar", "/configuracion"} {
+		if rec := env.do(http.MethodGet, page, "", false); rec.Code != http.StatusSeeOther {
+			t.Errorf("GET %s sin sesión: esperaba redirección al login, obtuvo %d", page, rec.Code)
+		}
+		if rec := env.do(http.MethodGet, page, "", true); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "<app-root>") {
+			t.Errorf("GET %s con sesión: esperaba la app, obtuvo %d", page, rec.Code)
+		}
+	}
+	if rec := env.do(http.MethodGet, "/no-existe.js", "", true); rec.Code != http.StatusNotFound {
+		t.Errorf("un archivo inexistente debía dar 404, obtuvo %d", rec.Code)
+	}
+}
+
+// Historial paginado con filtros y borrado de un comprobante (libera el pago asignado).
+func TestValidationsHistoryAndDelete(t *testing.T) {
+	env := newTestEnv(t, true, "")
+	ctx := context.Background()
+	tenantID := env.handler.tenantID
+
+	pay := &domain.MPPayment{TenantID: tenantID, MPPaymentID: 777000111, Amount: 500, Currency: "ARS", MPStatus: "approved",
+		ReconciliationStatus: "CONSUMED", ConsumedByReceiptID: "val-ok", PaymentDate: time.Now()}
+	if err := env.handler.repo.UpsertMPPayment(ctx, pay); err != nil {
+		t.Fatal(err)
+	}
+	yesterday := time.Now().AddDate(0, 0, -1)
+	for i, v := range []*domain.ReceiptValidation{
+		{ID: "val-old", ValidationResult: domain.StatusRejectedWrongDest, ExtractedAmount: 100, CreatedAt: yesterday},
+		{ID: "val-fraud", ValidationResult: domain.StatusFraudTampered, ExtractedAmount: 353, CreatedAt: time.Now().Add(-time.Minute)},
+		{ID: "val-ok", ValidationResult: domain.StatusVerifiedHeuristic, ExtractedAmount: 500, CreatedAt: time.Now()},
+	} {
+		v.TenantID, v.SenderPhone, v.WAMessageID, v.FileSHA256 = tenantID, "549110", fmt.Sprintf("wamid.h%d", i), fmt.Sprintf("sha%d", i)
+		if err := env.handler.repo.SaveReceiptValidation(ctx, v); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type page struct {
+		Items []struct {
+			ID       string `json:"id"`
+			Category string `json:"category"`
+		} `json:"items"`
+		Total int `json:"total"`
+	}
+	get := func(q string) page {
+		t.Helper()
+		rec := env.do(http.MethodGet, "/api/v1/validations?"+q, "", true)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET ?%s: %d %s", q, rec.Code, rec.Body.String())
+		}
+		var p page
+		_ = json.Unmarshal(rec.Body.Bytes(), &p)
+		return p
+	}
+
+	if p := get("page=1&page_size=2"); p.Total < 3 || len(p.Items) != 2 {
+		t.Fatalf("paginación: total=%d items=%d", p.Total, len(p.Items))
+	}
+	if p := get("category=fraud&date=" + time.Now().Format("2006-01-02")); p.Total != 1 || p.Items[0].ID != "val-fraud" || p.Items[0].Category != "fraud" {
+		t.Fatalf("filtro fraude de hoy: %+v", p)
+	}
+	if p := get("date=" + yesterday.Format("2006-01-02")); p.Total != 1 || p.Items[0].Category != "rejected" {
+		t.Fatalf("filtro de ayer: %+v", p)
+	}
+	if rec := env.do(http.MethodGet, "/api/v1/validations?date=26-10-2026", "", true); rec.Code != http.StatusBadRequest {
+		t.Fatalf("una fecha inválida debía dar 400, obtuvo %d", rec.Code)
+	}
+
+	rec := env.do(http.MethodDelete, "/api/v1/validations?id=val-ok", "", true)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"payment_released":true`) {
+		t.Fatalf("DELETE: %d %s", rec.Code, rec.Body.String())
+	}
+	payments, _ := env.handler.repo.ListMPPayments(ctx, tenantID, 100)
+	for _, p := range payments {
+		if p.MPPaymentID == 777000111 && p.ReconciliationStatus != "AVAILABLE" {
+			t.Fatalf("el pago debía quedar libre, está %s", p.ReconciliationStatus)
+		}
+	}
+	if rec := env.do(http.MethodDelete, "/api/v1/validations?id=val-ok", "", true); rec.Code != http.StatusNotFound {
+		t.Fatalf("borrar dos veces debía dar 404, obtuvo %d", rec.Code)
+	}
+	if rec := env.do(http.MethodGet, "/api/v1/export/validations.csv?category=fraud", "", true); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "val-fraud") || strings.Contains(rec.Body.String(), "val-old") {
+		t.Fatalf("el CSV debía respetar el filtro: %d", rec.Code)
+	}
+}
+
+// seedTestFixtures arma un comercio de prueba con Mercado Pago vinculado, tres empleados y dos
+// pagos acreditados. Estos datos existen solo dentro de los tests.
+func seedTestFixtures(t *testing.T, repo *persistence.MySQLRepository, vault *crypto.TokenVault, webhookSecret string) *domain.Tenant {
+	t.Helper()
+	ctx := context.Background()
+	tenant, err := repo.EnsureTenant(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.UpdateTenantProfile(ctx, tenant.ID, "Comercio de prueba", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	spec := domain.GetPlanSpecs()[domain.PlanPro]
+	if err := repo.UpdateTenantPlan(ctx, tenant.ID, spec.Plan, spec.MonthlyQuota, 120); err != nil {
+		t.Fatal(err)
+	}
+	encAcc, _ := vault.Encrypt("DEMO_TOKEN")
+	encRef, _ := vault.Encrypt("DEMO_REFRESH")
+	now := time.Now()
+	if err := repo.UpsertMPAccount(ctx, &domain.MPAccount{
+		TenantID: tenant.ID, MPUserID: 1492837465, ExpectedAlias: "comercio.prueba.mp", ExpectedCVU: "0000003100084920194829",
+		AccessTokenEnc: encAcc, RefreshTokenEnc: encRef, TokenExpiresAt: now.Add(6 * time.Hour), WebhookSecret: webhookSecret,
+		Status: "CONNECTED", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range []*domain.AuthorizedSender{
+		{PhoneNumber: "5491155001111", EmployeeName: "Dueño de prueba", Role: domain.RoleOwner},
+		{PhoneNumber: "5491155002222", EmployeeName: "Cajera de prueba", Role: domain.RoleCashier},
+		{PhoneNumber: "5491155003333", EmployeeName: "Repartidor de prueba", Role: domain.RoleDelivery},
+	} {
+		s.TenantID, s.IsActive, s.CreatedAt = tenant.ID, true, now
+		if err := repo.CreateAuthorizedSender(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []*domain.MPPayment{
+		{MPPaymentID: 88492019482, Amount: 15450.50, OperationType: "money_transfer", PayerCUIT: "20348912349", PayerName: "Juan Ignacio Perez", CoelsaID: "2410200000149281746391", PaymentDate: now.Add(-5 * time.Minute)},
+		{MPPaymentID: 88492019999, Amount: 24800, OperationType: "bank_transfer", PayerCUIT: "27319482714", PayerName: "Maria Florencia Sosa", CoelsaID: "2410200000998877665544", PaymentDate: now.Add(-8 * time.Minute)},
+	} {
+		p.TenantID, p.Currency, p.MPStatus = tenant.ID, "ARS", "approved"
+		if err := repo.UpsertMPPayment(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return tenant
+}
+
+func TestCustomersAndBusinessAPI(t *testing.T) {
+	env := newTestEnv(t, true, "")
+	ctx := context.Background()
+
+	// Los pagos de prueba crearon a sus clientes (por el CUIT del pagador)
+	rec := env.do(http.MethodGet, "/api/v1/customers?q=juan", "", true)
+	var page struct {
+		Items []struct {
+			ID       string `json:"id"`
+			Name     string `json:"name"`
+			CUIT     string `json:"cuit"`
+			Payments int    `json:"payments"`
+		} `json:"items"`
+		Total int `json:"total"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	if rec.Code != http.StatusOK || page.Total != 1 || page.Items[0].CUIT != "20348912349" || page.Items[0].Payments != 1 {
+		t.Fatalf("GET /customers?q=juan: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := env.do(http.MethodGet, "/api/v1/customers?id="+page.Items[0].ID, "", true); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Juan Ignacio Perez") {
+		t.Fatalf("GET /customers?id: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := env.do(http.MethodGet, "/api/v1/customers?id=no-existe", "", true); rec.Code != http.StatusNotFound {
+		t.Fatalf("un cliente inexistente debía dar 404, obtuvo %d", rec.Code)
+	}
+	if rec := env.do(http.MethodGet, "/api/v1/customers?risk=fraud", "", true); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"total":0`) {
+		t.Fatalf("sin fraudes la lista debía estar vacía: %s", rec.Body.String())
+	}
+
+	// Datos del comercio
+	if rec := env.do(http.MethodPost, "/api/v1/business", `{"business_name":"Mi Negocio","cuit":"30-71649281-9","email":"hola@minegocio.com"}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("POST /business: %d %s", rec.Code, rec.Body.String())
+	}
+	tenant, _ := env.handler.repo.GetTenantByID(ctx, env.handler.tenantID)
+	if tenant.BusinessName != "Mi Negocio" || tenant.CUIT != "30716492819" || tenant.Email != "hola@minegocio.com" {
+		t.Fatalf("datos guardados: %+v", tenant)
+	}
+	for _, body := range []string{`{"business_name":""}`, `{"business_name":"X","cuit":"123"}`, `{"business_name":"X","email":"no-es-email"}`} {
+		if rec := env.do(http.MethodPost, "/api/v1/business", body, true); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: esperaba 400, obtuvo %d", body, rec.Code)
+		}
 	}
 }

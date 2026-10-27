@@ -64,6 +64,7 @@ type mpPaymentResponse struct {
 	Payer struct {
 		FirstName      string `json:"first_name"`
 		LastName       string `json:"last_name"`
+		Email          string `json:"email"`
 		Identification struct {
 			Type   string `json:"type"`
 			Number string `json:"number"`
@@ -400,6 +401,7 @@ func mapRawMPToDomain(tenantID string, rawJSON []byte) (*domain.MPPayment, error
 		OperationType:        parsed.OperationType,
 		PayerCUIT:            parsed.Payer.Identification.Number,
 		PayerName:            strings.TrimSpace(fmt.Sprintf("%s %s", parsed.Payer.FirstName, parsed.Payer.LastName)),
+		PayerEmail:           strings.TrimSpace(parsed.Payer.Email),
 		CoelsaID:             parsed.PointOfInteraction.TransactionData.E2EID,
 		PaymentDate:          payDate,
 		ReconciliationStatus: "AVAILABLE",

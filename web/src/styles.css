@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+/* Modo oscuro por clase (.dark en <html>), así se puede elegir a mano */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+  html.dark {
+    color-scheme: dark;
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* Piezas reutilizables: pocas, neutras y sin colores llamativos */
+@layer components {
+  .card {
+    @apply rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900;
+  }
+  .card-header {
+    @apply flex flex-wrap items-center justify-between gap-3 border-b border-zinc-200 px-5 py-4 dark:border-zinc-800;
+  }
+  .card-title {
+    @apply text-sm font-semibold text-zinc-900 dark:text-zinc-100;
+  }
+  .card-help {
+    @apply mt-0.5 text-sm text-zinc-500 dark:text-zinc-400;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium transition-colors
+      focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-400
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply bg-zinc-900 text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300;
+  }
+  .btn-secondary {
+    @apply border border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50
+      dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800;
+  }
+  .btn-ghost {
+    @apply text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100;
+  }
+  .btn-danger {
+    @apply bg-red-600 text-white hover:bg-red-700 dark:bg-red-500 dark:hover:bg-red-600;
+  }
+  .btn-sm {
+    @apply px-2.5 py-1.5 text-xs;
+  }
+
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-zinc-700 dark:text-zinc-300;
+  }
+  .input {
+    @apply block w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400
+      focus:border-zinc-400 focus:ring-2 focus:ring-zinc-200 focus:outline-none
+      disabled:bg-zinc-50 disabled:text-zinc-400
+      dark:border-zinc-700 dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-500
+      dark:focus:border-zinc-500 dark:focus:ring-zinc-800 dark:disabled:bg-zinc-900;
+  }
+
+  .muted {
+    @apply text-zinc-500 dark:text-zinc-400;
+  }
+  .divide-soft > * + * {
+    @apply border-t border-zinc-100 dark:border-zinc-800;
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}

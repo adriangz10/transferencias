@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,6 +47,8 @@ var (
 )
 
 type WebhooksHandler struct {
+	// tenantID es el comercio de esta instalación (se crea o se lee de la base al arrancar)
+	tenantID   string
 	cfg        *config.Config
 	repo       *persistence.MySQLRepository
 	vault      *crypto.TokenVault
@@ -80,9 +81,11 @@ func NewWebhooksHandler(
 	waClient *whatsapp.Client,
 	queueStore *queue.RedisQueueStore,
 	verifyUC *application.VerifyReceiptUseCase,
+	tenantID string,
 ) *WebhooksHandler {
 	baseCtx, cancel := context.WithCancel(context.Background())
 	return &WebhooksHandler{
+		tenantID:   tenantID,
 		cfg:        cfg,
 		repo:       repo,
 		vault:      vault,
@@ -120,6 +123,9 @@ func (h *WebhooksHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/posnet/charge", admin(h.handleCreatePosnetCharge))
 	mux.HandleFunc("/api/v1/receipts/upload", admin(h.handleReceiptUpload))
 	mux.HandleFunc("/api/v1/export/validations.csv", admin(h.handleExportValidationsCSV))
+	mux.HandleFunc("/api/v1/validations", admin(h.handleValidations))
+	mux.HandleFunc("/api/v1/customers", admin(h.handleCustomers))
+	mux.HandleFunc("/api/v1/business", admin(h.handleBusiness))
 
 	// Simulador: solo con DEMO_MODE=true
 	mux.HandleFunc("/api/v1/simulate/receipt", admin(h.demoOnly(h.handleSimulateReceipt)))
@@ -130,10 +136,11 @@ func (h *WebhooksHandler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Login del panel
 	mux.HandleFunc("/login", h.handleLogin)
+	mux.HandleFunc("/api/v1/login", h.handleLogin) // el formulario de Angular envía acá (también en desarrollo)
 	mux.HandleFunc("/logout", h.handleLogout)
 
-	// Panel Web
-	mux.HandleFunc("/", admin(h.handleWebUI))
+	// Panel Web (Angular). Los archivos estáticos son públicos; las páginas piden sesión.
+	mux.HandleFunc("/", h.handleWebUI)
 }
 
 // Shutdown espera a que terminen los procesamientos en curso (o cancela al vencer ctx).
@@ -412,9 +419,6 @@ func (h *WebhooksHandler) chargeDestination(acc *domain.MPAccount) string {
 	if acc != nil && acc.ExpectedCVU != "" {
 		return acc.ExpectedCVU
 	}
-	if h.cfg.DemoMode {
-		return "don.mateo.mp"
-	}
 	return ""
 }
 
@@ -660,7 +664,8 @@ func phoneCandidates(from string) []string {
 func isFraudStatus(s domain.ValidationStatus) bool {
 	return s == domain.StatusFraudDuplicateFile ||
 		s == domain.StatusFraudAlreadyUsed ||
-		s == domain.StatusFraudIncomplete
+		s == domain.StatusFraudIncomplete ||
+		s == domain.StatusFraudTampered
 }
 
 func (h *WebhooksHandler) notifyOwnersOfFraud(ctx context.Context, tenantID string, triggeredBy *domain.AuthorizedSender, outcome *domain.VerificationOutcome) {
@@ -731,7 +736,7 @@ func (h *WebhooksHandler) handleMPWebhook(w http.ResponseWriter, r *http.Request
 
 	if acc == nil {
 		if h.cfg.DemoMode {
-			acc, _ = h.repo.GetActiveMPAccount(r.Context(), persistence.DefaultDemoTenantID)
+			acc, _ = h.repo.GetActiveMPAccount(r.Context(), h.tenantID)
 		}
 		if acc == nil {
 			log.Printf("ℹ️ Webhook MP para user_id %d sin cuenta vinculada: ignorado", body.UserID)
@@ -781,7 +786,11 @@ func (h *WebhooksHandler) ingestMPPaymentAndResolveQueue(ctx context.Context, pa
 		if claimErr == nil {
 			notifications = append(notifications, fmt.Sprintf("⚡ Orden /cobrar pagada: $%.2f (MP #%d - %s)", payment.Amount, payment.MPPaymentID, payment.PayerName))
 			if order.RequestedPhone != "" {
-				_ = h.sendWA(ctx, order.RequestedPhone, transferReply(replyCorrect, payment.Amount)+" ("+order.Reference+")")
+				msg := verifiedReply(payment.Amount, payment.PayerName, "", payment.PaymentDate)
+				if strings.TrimSpace(order.Reference) != "" {
+					msg += " (" + order.Reference + ")"
+				}
+				_ = h.sendWA(ctx, order.RequestedPhone, msg)
 			}
 		} else if !errors.Is(claimErr, domain.ErrPaymentAlreadyConsumed) {
 			log.Printf("⚠️ No se pudo asignar el pago %d a la orden %s: %v", payment.MPPaymentID, order.ID, claimErr)
@@ -824,7 +833,15 @@ func (h *WebhooksHandler) ingestMPPaymentAndResolveQueue(ctx context.Context, pa
 			_ = h.repo.UpdateReceiptValidationStatus(ctx, item.ValidationID, newStatus, claimed.ID)
 			_ = h.queue.RemovePendingReceipt(ctx, payment.TenantID, item.ValidationID)
 
-			_ = h.sendWA(ctx, item.SenderPhone, transferReply(replyCorrect, claimed.Amount)+pendingFrom(item))
+			clientName := item.SenderName
+			if strings.TrimSpace(clientName) == "" {
+				clientName = claimed.PayerName
+			}
+			arrivedAt := claimed.PaymentDate
+			if arrivedAt.IsZero() {
+				arrivedAt = payment.PaymentDate
+			}
+			_ = h.sendWA(ctx, item.SenderPhone, verifiedReply(claimed.Amount, clientName, item.SourceBankOrWallet, arrivedAt))
 			notifications = append(notifications, fmt.Sprintf("Notificado proactivamente a %s (%s)", item.EmployeeName, item.SenderPhone))
 
 		case errors.Is(claimErr, domain.ErrPaymentAlreadyConsumed) && !item.MatchByAmount:
@@ -857,13 +874,10 @@ func orDash(s string) string {
 
 // handleMPOAuthConnect redirige a la autorización OAuth 2.0 de Mercado Pago con un state firmado.
 func (h *WebhooksHandler) handleMPOAuthConnect(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.URL.Query().Get("tenant_id")
-	if tenantID == "" {
-		tenantID = persistence.DefaultDemoTenantID
-	}
-	state := h.oauthState.Issue(tenantID)
+	state := h.oauthState.Issue(h.tenantID)
 
-	if h.cfg.DemoMode && (r.URL.Query().Get("demo") == "1" || h.cfg.MPClientID == "MP_DEMO_CLIENT_ID") {
+	// En modo demo la vinculación siempre es simulada: nunca se toca una cuenta real
+	if h.cfg.DemoMode {
 		http.Redirect(w, r, fmt.Sprintf("/oauth/mp/callback?code=DEMO_CODE_%d&state=%s", time.Now().Unix(), state), http.StatusFound)
 		return
 	}
@@ -927,10 +941,6 @@ func (h *WebhooksHandler) handleMPOAuthCallback(w http.ResponseWriter, r *http.R
 		if existing.MPUserID == tokenResp.UserID {
 			acc.ID = existing.ID
 		}
-	} else if h.cfg.DemoMode {
-		acc.ExpectedAlias = "don.mateo.mp"
-		acc.ExpectedCVU = "0000003100084920194821"
-		acc.ExpectedHolderName = "Pizzeria Don Mateo SRL"
 	}
 
 	if err := h.repo.UpsertMPAccount(r.Context(), acc); err != nil {
@@ -938,10 +948,6 @@ func (h *WebhooksHandler) handleMPOAuthCallback(w http.ResponseWriter, r *http.R
 		http.Error(w, "No se pudo guardar la cuenta vinculada", http.StatusInternalServerError)
 		return
 	}
-	if !h.cfg.DemoMode {
-		_ = h.repo.RevokeDemoMPAccount(r.Context())
-	}
-
 	http.Redirect(w, r, "/?oauth=connected", http.StatusFound)
 }
 
@@ -952,12 +958,11 @@ func (h *WebhooksHandler) handleMPOAuthCallback(w http.ResponseWriter, r *http.R
 // handleDashboardData devuelve el estado completo del comercio para el Dashboard Web.
 func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantID := persistence.DefaultDemoTenantID
+	tenantID := h.tenantID
 
 	tenant, _ := h.repo.GetTenantByID(ctx, tenantID)
 	mpAcc, _ := h.repo.GetActiveMPAccount(ctx, tenantID)
 	senders, _ := h.repo.ListAuthorizedSenders(ctx, tenantID)
-	validations, _ := h.repo.ListReceiptValidations(ctx, tenantID, 50)
 	payments, _ := h.repo.ListMPPayments(ctx, tenantID, 50)
 	pendingQueue, _ := h.queue.ListPendingReceipts(ctx, tenantID)
 	chargeOrders, _ := h.queue.ListChargeOrders(ctx, tenantID)
@@ -967,7 +972,7 @@ func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Req
 		"plans":         domain.GetPlanSpecs(),
 		"mp_account":    mpAcc,
 		"senders":       senders,
-		"validations":   validations,
+		"today":         h.todayStats(r, tenantID),
 		"payments":      payments,
 		"pending_queue": pendingQueue,
 		"charge_orders": chargeOrders,
@@ -985,7 +990,7 @@ func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Req
 
 func (h *WebhooksHandler) handleSenders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantID := persistence.DefaultDemoTenantID
+	tenantID := h.tenantID
 
 	switch r.Method {
 	case http.MethodPost:
@@ -1053,7 +1058,7 @@ func (h *WebhooksHandler) handleAccount(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON inválido"})
 		return
 	}
-	status, msg := h.updateAccountDestination(r.Context(), persistence.DefaultDemoTenantID, req.ExpectedAlias, req.ExpectedCVU)
+	status, msg := h.updateAccountDestination(r.Context(), h.tenantID, req.ExpectedAlias, req.ExpectedCVU)
 	if status != http.StatusOK {
 		writeJSON(w, status, map[string]string{"error": msg})
 		return
@@ -1109,7 +1114,7 @@ func (h *WebhooksHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "La ventana debe estar entre 5 y 1440 minutos"})
 		return
 	}
-	if err := h.repo.UpdateTenantPlan(r.Context(), persistence.DefaultDemoTenantID, spec.Plan, spec.MonthlyQuota, req.TimeWindowMinutes); err != nil {
+	if err := h.repo.UpdateTenantPlan(r.Context(), h.tenantID, spec.Plan, spec.MonthlyQuota, req.TimeWindowMinutes); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "No se pudo actualizar el plan"})
 		return
 	}
@@ -1136,14 +1141,14 @@ func (h *WebhooksHandler) handleCreatePosnetCharge(w http.ResponseWriter, r *htt
 	if req.Reference == "" {
 		req.Reference = "Venta Mostrador"
 	}
-	acc, _ := h.repo.GetActiveMPAccount(r.Context(), persistence.DefaultDemoTenantID)
+	acc, _ := h.repo.GetActiveMPAccount(r.Context(), h.tenantID)
 	dest := h.chargeDestination(acc)
 	if dest == "" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Configurá el alias o CVU de cobro primero"})
 		return
 	}
 
-	order, err := h.queue.CreateUniqueChargeOrder(r.Context(), persistence.DefaultDemoTenantID, req.RequestedBy, "", req.Reference, dest, req.BaseAmount)
+	order, err := h.queue.CreateUniqueChargeOrder(r.Context(), h.tenantID, req.RequestedBy, "", req.Reference, dest, req.BaseAmount)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, queue.ErrNoUniqueAmountAvailable) {
@@ -1194,7 +1199,7 @@ func (h *WebhooksHandler) handleReceiptUpload(w http.ResponseWriter, r *http.Req
 		mimeType = http.DetectContentType(fileBytes)
 	}
 
-	tenant, err := h.repo.GetTenantByID(r.Context(), persistence.DefaultDemoTenantID)
+	tenant, err := h.repo.GetTenantByID(r.Context(), h.tenantID)
 	if err != nil || tenant == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Comercio no encontrado"})
 		return
@@ -1304,43 +1309,6 @@ func (h *WebhooksHandler) pickPanelSender(ctx context.Context, tenantID, phone s
 	return first
 }
 
-// handleExportValidationsCSV exporta la auditoría de comprobantes en CSV compatible con Excel.
-func (h *WebhooksHandler) handleExportValidationsCSV(w http.ResponseWriter, r *http.Request) {
-	validations, err := h.repo.ListReceiptValidations(r.Context(), persistence.DefaultDemoTenantID, 500)
-	if err != nil {
-		http.Error(w, "No se pudo exportar", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", `attachment; filename="veripago_auditoria_comprobantes.csv"`)
-	_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM para Excel
-
-	writer := csv.NewWriter(w)
-	_ = writer.Write([]string{
-		"ID Validacion", "Fecha y Hora", "Telefono Empleado", "Resultado Conciliacion",
-		"Monto Extraido (ARS)", "Nro Operacion", "Banco / Billetera Origen",
-		"Nombre Emisor", "CUIT Emisor", "Alias/CVU Destino", "Hash SHA-256 Archivo", "Tiempo Procesamiento (ms)",
-	})
-	for _, v := range validations {
-		_ = writer.Write([]string{
-			v.ID,
-			v.CreatedAt.Format("2006-01-02 15:04:05"),
-			csvSafe(v.SenderPhone),
-			string(v.ValidationResult),
-			fmt.Sprintf("%.2f", v.ExtractedAmount),
-			csvSafe(v.ExtractedOpNumber),
-			csvSafe(v.ExtractedSourceBank),
-			csvSafe(v.ExtractedSenderName),
-			csvSafe(v.ExtractedSenderCUIT),
-			csvSafe(v.ExtractedReceiverAliasOrCBU),
-			v.FileSHA256,
-			strconv.Itoa(v.ProcessingTimeMs),
-		})
-	}
-	writer.Flush()
-}
-
 // csvSafe evita que un texto leído de un comprobante se ejecute como fórmula al abrir el CSV en Excel.
 func csvSafe(s string) string {
 	if s != "" && strings.ContainsRune("=+-@\t\r", rune(s[0])) {
@@ -1365,7 +1333,7 @@ func (h *WebhooksHandler) handleSimulateReceipt(w http.ResponseWriter, r *http.R
 	}
 
 	ctx := r.Context()
-	tenant, err := h.repo.GetTenantByID(ctx, persistence.DefaultDemoTenantID)
+	tenant, err := h.repo.GetTenantByID(ctx, h.tenantID)
 	if err != nil || tenant == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Comercio demo no encontrado"})
 		return
@@ -1484,7 +1452,6 @@ func (h *WebhooksHandler) buildScenarioPayload(
 			SourceBankOrWallet:  "Mercado Pago",
 			SenderName:          "Carlos Alberto Gomez",
 			SenderCUIT:          "20351122334",
-			ReceiverName:        "Pizzeria Don Mateo SRL",
 			ReceiverAliasOrCVU:  expectedAlias,
 			ReceiptTimestampISO: now.Format(time.RFC3339),
 		}
@@ -1523,7 +1490,6 @@ func (h *WebhooksHandler) buildScenarioPayload(
 			SourceBankOrWallet:  "Banco Galicia",
 			SenderName:          "Valeria Martinez",
 			SenderCUIT:          "27389911223",
-			ReceiverName:        "Pizzeria Don Mateo SRL",
 			ReceiverAliasOrCVU:  expectedAlias,
 			ReceiptTimestampISO: now.Format(time.RFC3339),
 		}
@@ -1697,7 +1663,7 @@ func (h *WebhooksHandler) handleSimulateMPWebhook(w http.ResponseWriter, r *http
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req)
 
 	ctx := r.Context()
-	tenantID := persistence.DefaultDemoTenantID
+	tenantID := h.tenantID
 	coelsa := randomCoelsa()
 
 	// Sin monto: tomamos el primer comprobante en espera (con su COELSA) o la primera orden /cobrar

@@ -52,8 +52,14 @@ func TestMySQLMigrationsAndQueries(t *testing.T) {
 
 	repo := NewMySQLRepository(db)
 	tenantID := "test-" + uuid.NewString()[:31]
+	if _, err := db.ExecContext(ctx, `INSERT INTO tenants (id, business_name, plan_type, monthly_quota, time_window_minutes)
+		VALUES (?, 'Comercio temporal de test', 'PRO', 1500, 120)`, tenantID); err != nil {
+		t.Fatalf("creando comercio temporal: %v", err)
+	}
 	defer func() {
-		_, _ = db.ExecContext(context.Background(), `DELETE FROM mp_payments WHERE tenant_id = ?`, tenantID)
+		bg := context.Background()
+		_, _ = db.ExecContext(bg, `DELETE FROM receipt_validations WHERE tenant_id = ?`, tenantID)
+		_, _ = db.ExecContext(bg, `DELETE FROM tenants WHERE id = ?`, tenantID) // borra en cascada pagos y clientes
 	}()
 
 	// Las consultas nuevas deben ser SQL válido
@@ -90,5 +96,58 @@ func TestMySQLMigrationsAndQueries(t *testing.T) {
 	}
 	if _, err := repo.ClaimPaymentByExactID(ctx, tenantID, 900000000001, 1234.56, "v-4"); !errors.Is(err, ErrPaymentAlreadyConsumed) {
 		t.Fatalf("esperaba ErrPaymentAlreadyConsumed, obtuvo %v", err)
+	}
+
+	// Clientes: el pago queda asociado a su cliente por CUIT
+	cust, err := repo.UpsertCustomer(ctx, tenantID, "20-11111111-2", "Adrián  Gómez", "", time.Now())
+	if err != nil || cust == nil || cust.CUIT != "20111111112" {
+		t.Fatalf("UpsertCustomer: %+v %v", cust, err)
+	}
+	var payCustomer sql.NullString
+	if err := db.QueryRowContext(ctx, `SELECT customer_id FROM mp_payments WHERE tenant_id = ? AND mp_payment_id = 900000000001`, tenantID).Scan(&payCustomer); err != nil || payCustomer.String != cust.ID {
+		t.Fatalf("el pago debía quedar asociado al cliente %s, tiene %q (%v)", cust.ID, payCustomer.String, err)
+	}
+	// Primero conocido solo por nombre; al aparecer su CUIT se completa el mismo registro
+	byName, err := repo.UpsertCustomer(ctx, tenantID, "", "Laura Pérez", "", time.Now())
+	if err != nil || byName == nil {
+		t.Fatalf("UpsertCustomer por nombre: %v", err)
+	}
+	withCUIT, err := repo.UpsertCustomer(ctx, tenantID, "27222222223", "LAURA PEREZ", "laura@example.com", time.Now())
+	if err != nil || withCUIT.ID != byName.ID || withCUIT.CUIT != "27222222223" || withCUIT.Email != "laura@example.com" {
+		t.Fatalf("debía completar el mismo cliente con el CUIT: %+v %v", withCUIT, err)
+	}
+
+	// Comprobantes del cliente: historial, riesgo, búsqueda y borrado
+	for i, st := range []domain.ValidationStatus{domain.StatusVerifiedHeuristic, domain.StatusFraudTampered, domain.StatusRejectedWrongDest} {
+		v := &domain.ReceiptValidation{TenantID: tenantID, CustomerID: cust.ID, SenderPhone: "549110", FileSHA256: "sha-test",
+			ExtractedAmount: 1234.56, ExtractedSenderCUIT: "20111111112", ExtractedSenderName: "Adrián Gómez", ValidationResult: st,
+			WAMessageID: "wamid.test." + uuid.NewString(), CreatedAt: time.Now().Add(time.Duration(i) * time.Second)}
+		if err := repo.SaveReceiptValidation(ctx, v); err != nil {
+			t.Fatalf("SaveReceiptValidation: %v", err)
+		}
+	}
+	fraud, last, recent, err := repo.CustomerRiskStats(ctx, tenantID, cust.ID, time.Now().Add(-time.Hour))
+	if err != nil || fraud != 1 || last == nil || recent != 2 {
+		t.Fatalf("CustomerRiskStats: fraud=%d last=%v recent=%d err=%v", fraud, last, recent, err)
+	}
+	list, total, err := repo.SearchCustomers(ctx, tenantID, domain.CustomerFilter{Query: "gomez", Limit: 10})
+	if err != nil || total != 1 || list[0].Receipts != 3 || list[0].Fraud != 1 || list[0].Verified != 1 || list[0].Payments != 1 {
+		t.Fatalf("SearchCustomers por nombre: total=%d %+v %v", total, list, err)
+	}
+	if _, total, err := repo.SearchCustomers(ctx, tenantID, domain.CustomerFilter{Query: "2011", Limit: 10}); err != nil || total != 1 {
+		t.Fatalf("SearchCustomers por CUIT: total=%d %v", total, err)
+	}
+	if _, total, err := repo.SearchCustomers(ctx, tenantID, domain.CustomerFilter{OnlyFraud: true, Limit: 10}); err != nil || total != 1 {
+		t.Fatalf("SearchCustomers solo fraude: total=%d %v", total, err)
+	}
+	page, total, err := repo.SearchReceiptValidations(ctx, tenantID, domain.ValidationFilter{CustomerID: cust.ID, Statuses: domain.FraudStatuses, Limit: 10})
+	if err != nil || total != 1 || page[0].CustomerID != cust.ID {
+		t.Fatalf("SearchReceiptValidations por cliente: total=%d %v", total, err)
+	}
+	if refs, err := repo.ListRecentVerifiedByAmount(ctx, tenantID, 1234.56, time.Now().Add(-time.Hour)); err != nil || len(refs) != 1 {
+		t.Fatalf("ListRecentVerifiedByAmount: %d %v", len(refs), err)
+	}
+	if _, err := repo.DeleteReceiptValidation(ctx, tenantID, page[0].ID); err != nil {
+		t.Fatalf("DeleteReceiptValidation: %v", err)
 	}
 }

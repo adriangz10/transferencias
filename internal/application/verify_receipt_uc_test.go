@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -366,5 +367,212 @@ func TestSameReceiptDifferentImage_IsDuplicate(t *testing.T) {
 	third, _ := other.Execute(ctx, tenantID, "DEMO_TOKEN", Destination{}, 120, []byte("otro-comprobante"), "image/jpeg")
 	if third.Status == domain.StatusFraudDuplicateFile {
 		t.Fatal("un comprobante con otro número de operación no es repetido")
+	}
+}
+
+// Caso real (26/10/2026): se envió el PDF de Brubank y se verificó; después se envió una captura
+// del mismo PDF. Gemini no leyó el ID COELSA en ninguno de los dos, así que el hash y el número de
+// operación no sirven. Igual se tiene que reconocer como el mismo comprobante (emisor + monto)
+// y no quedar "pendiente".
+func TestSameReceiptPDFThenScreenshot_WithoutIDs_IsAlreadySent(t *testing.T) {
+	ctx := context.Background()
+	repo := persistence.NewMySQLRepository(nil)
+	tenantID := "tenant-pdf-captura"
+	seedPayment(t, repo, &domain.MPPayment{TenantID: tenantID, MPPaymentID: 186270633012, Amount: 500, PayerCUIT: "20385452668", CoelsaID: "RD06ZO9W4M641XG725GP7X", PaymentDate: time.Now().Add(-2 * time.Minute)})
+
+	brubank := domain.ExtractedReceiptData{
+		IsValidReceipt: true, IsCompletedTransfer: true, Amount: 500, SourceBankOrWallet: "Brubank",
+		SenderName: "Adrián Alberto Gómez", SenderCUIT: "20385452668",
+	}
+	uc := NewVerifyReceiptUseCase(repo, fixedExtractor(brubank), mp.NewMPClient(true))
+
+	pdf, err := uc.ExecuteAndAudit(ctx, tenantID, "5491100000000", "wamid.pdf", "DEMO_TOKEN", Destination{}, 120, []byte("%PDF-comprobante-brubank"), "application/pdf")
+	if err != nil || pdf.Status != domain.StatusVerifiedHeuristic {
+		t.Fatalf("el PDF debía verificarse, obtuvo %+v (%v)", pdf, err)
+	}
+	shot, err := uc.ExecuteAndAudit(ctx, tenantID, "5491100000000", "wamid.captura", "DEMO_TOKEN", Destination{}, 120, []byte("captura-del-pdf.jpg"), "image/jpeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shot.Status != domain.StatusFraudDuplicateFile || shot.AlreadySentAt == nil {
+		t.Fatalf("la captura del mismo comprobante debía detectarse como ya enviada, obtuvo %s", shot.Status)
+	}
+
+	// Al revés: primero la captura y después el PDF (el nombre viene sin acentos, sin CUIT)
+	tenant2 := "tenant-captura-pdf"
+	seedPayment(t, repo, &domain.MPPayment{TenantID: tenant2, MPPaymentID: 186270633013, Amount: 500, PaymentDate: time.Now().Add(-2 * time.Minute)})
+	if out, _ := uc.ExecuteAndAudit(ctx, tenant2, "5491100000000", "wamid.c2", "DEMO_TOKEN", Destination{}, 120, []byte("captura-primero.jpg"), "image/jpeg"); out.Status != domain.StatusVerifiedHeuristic {
+		t.Fatalf("la captura debía verificarse, obtuvo %s", out.Status)
+	}
+	noCUIT := brubank
+	noCUIT.SenderCUIT, noCUIT.SenderName = "", "ADRIAN  ALBERTO GOMEZ"
+	ucPDF := NewVerifyReceiptUseCase(repo, fixedExtractor(noCUIT), mp.NewMPClient(true))
+	if out, _ := ucPDF.ExecuteAndAudit(ctx, tenant2, "5491100000000", "wamid.p2", "DEMO_TOKEN", Destination{}, 120, []byte("%PDF-despues"), "application/pdf"); out.Status != domain.StatusFraudDuplicateFile {
+		t.Fatalf("el PDF después de la captura debía detectarse como ya enviado, obtuvo %s", out.Status)
+	}
+}
+
+// Con la hora del comprobante se distingue el reenvío de una segunda transferencia real.
+func TestSameReceiptByTime(t *testing.T) {
+	ctx := context.Background()
+	repo := persistence.NewMySQLRepository(nil)
+	tenantID := "tenant-hora"
+	art := time.FixedZone("ART", -3*3600)
+	firstAt := time.Now().In(art).Add(-30 * time.Minute).Truncate(time.Minute)
+	seedPayment(t, repo, &domain.MPPayment{TenantID: tenantID, MPPaymentID: 1, Amount: 500, PayerCUIT: "20385452668", PaymentDate: firstAt.Add(9 * time.Second)})
+
+	receiptAt := func(at time.Time) domain.ExtractedReceiptData {
+		return domain.ExtractedReceiptData{
+			IsValidReceipt: true, IsCompletedTransfer: true, Amount: 500, SourceBankOrWallet: "Brubank",
+			SenderName: "Adrián Alberto Gómez", SenderCUIT: "20385452668",
+			ReceiptTimestampISO: at.Format("2006-01-02T15:04:05"), // sin zona horaria, como suele venir
+		}
+	}
+	first := NewVerifyReceiptUseCase(repo, fixedExtractor(receiptAt(firstAt)), mp.NewMPClient(true))
+	if out, _ := first.ExecuteAndAudit(ctx, tenantID, "549110", "w1", "T", Destination{}, 120, []byte("pdf-1"), "application/pdf"); out.Status != domain.StatusVerifiedHeuristic {
+		t.Fatalf("el primero debía verificarse, obtuvo %s", out.Status)
+	}
+
+	// Llega un segundo pago real por el mismo monto. La captura del PRIMER comprobante no debe
+	// quedarse con ese pago: la hora coincide con la venta ya verificada.
+	seedPayment(t, repo, &domain.MPPayment{TenantID: tenantID, MPPaymentID: 2, Amount: 500, PayerCUIT: "20385452668", PaymentDate: time.Now()})
+	if out, _ := first.ExecuteAndAudit(ctx, tenantID, "549110", "w2", "T", Destination{}, 120, []byte("captura-1"), "image/jpeg"); out.Status != domain.StatusFraudDuplicateFile || out.AlreadySentBySender {
+		t.Fatalf("la captura del primer comprobante debía ser 'ya enviado' (confirmado por hora), obtuvo %s", out.Status)
+	}
+
+	// El comprobante de la segunda transferencia (otra hora) sí se verifica con el pago nuevo
+	second := NewVerifyReceiptUseCase(repo, fixedExtractor(receiptAt(time.Now().In(art))), mp.NewMPClient(true))
+	if out, _ := second.ExecuteAndAudit(ctx, tenantID, "549110", "w3", "T", Destination{}, 120, []byte("pdf-2"), "application/pdf"); out.Status != domain.StatusVerifiedHeuristic {
+		t.Fatalf("la segunda transferencia debía verificarse, obtuvo %s", out.Status)
+	}
+
+	// Una tercera transferencia (otra hora) que todavía no llegó queda pendiente, no "ya enviado"
+	third := NewVerifyReceiptUseCase(repo, fixedExtractor(receiptAt(time.Now().In(art).Add(20*time.Minute))), mp.NewMPClient(true))
+	if out, _ := third.Execute(ctx, tenantID, "T", Destination{}, 120, []byte("pdf-3"), "application/pdf"); out.Status != domain.StatusRejectedNotFound {
+		t.Fatalf("una transferencia nueva a otra hora debía quedar pendiente, obtuvo %s", out.Status)
+	}
+
+	// Otra persona por el mismo monto tampoco es un repetido
+	other := receiptAt(time.Now().In(art).Add(20 * time.Minute))
+	other.SenderCUIT, other.SenderName = "27111111119", "Otra Persona"
+	other.ReceiptTimestampISO = ""
+	ucOther := NewVerifyReceiptUseCase(repo, fixedExtractor(other), mp.NewMPClient(true))
+	if out, _ := ucOther.Execute(ctx, tenantID, "T", Destination{}, 120, []byte("pdf-otra"), "application/pdf"); out.Status == domain.StatusFraudDuplicateFile {
+		t.Fatal("el comprobante de otra persona no es repetido")
+	}
+}
+
+func TestParseReceiptTimestamp(t *testing.T) {
+	for _, s := range []string{"2026-10-26T20:55:00-03:00", "2026-10-26T20:55:00", "2026-10-26T20:55", "2026-10-26 20:55:00"} {
+		got, ok := domain.ParseReceiptTimestamp(s)
+		if !ok || got.UTC().Format("15:04") != "23:55" {
+			t.Errorf("ParseReceiptTimestamp(%q) = %v, %v", s, got, ok)
+		}
+	}
+	if _, ok := domain.ParseReceiptTimestamp("26/10/2026"); ok {
+		t.Error("un formato desconocido no debía interpretarse")
+	}
+}
+
+// Caso real (26/10/2026): comprobante de Ualá con el CVU del comercio cambiado en el último
+// dígito. No es "otra cuenta": es un comprobante editado (y ese CVU no pasa el verificador).
+func TestTamperedDestination_IsFraud(t *testing.T) {
+	ctx := context.Background()
+	repo := persistence.NewMySQLRepository(nil)
+	dest := Destination{Alias: "adriangz10.mp", CVU: "0000003100020875666305"}
+
+	if !ValidCBU("0000003100020875666305") {
+		t.Fatal("el CVU real del comercio debía ser válido")
+	}
+	if ValidCBU("0000003100020875666306") {
+		t.Fatal("un CVU con el último dígito cambiado no debía ser válido")
+	}
+
+	cases := []struct {
+		receiver string
+		want     domain.ValidationStatus
+	}{
+		{"0000003100020875666306", domain.StatusFraudTampered},     // último dígito cambiado
+		{"0000003100020875966305", domain.StatusFraudTampered},     // un dígito del medio cambiado
+		{"adriangz1O.mp", domain.StatusFraudTampered},              // alias con una letra cambiada
+		{"0000003100084920194829", domain.StatusRejectedWrongDest}, // otra cuenta de MP (CVU válido)
+		{"otro.comercio.mp", domain.StatusRejectedWrongDest},       // alias de otra persona
+	}
+	for _, c := range cases {
+		uc := NewVerifyReceiptUseCase(repo, fixedExtractor(domain.ExtractedReceiptData{
+			IsValidReceipt: true, IsCompletedTransfer: true, Amount: 353, SourceBankOrWallet: "Ualá",
+			ReceiverAliasOrCVU: c.receiver,
+		}), mp.NewMPClient(true))
+		out, err := uc.Execute(ctx, "tenant-adulterado", "T", dest, 120, []byte("comprobante-"+c.receiver), "image/jpeg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out.Status != c.want {
+			t.Errorf("destino %q: obtuvo %s, esperaba %s", c.receiver, out.Status, c.want)
+		}
+	}
+}
+
+// Cruce con el historial: el cliente que ya intentó un fraude queda marcado en sus próximos
+// comprobantes, y un CUIT conocido con otro nombre se avisa.
+func TestCustomerHistoryCrossCheck(t *testing.T) {
+	ctx := context.Background()
+	repo := persistence.NewMySQLRepository(nil)
+	tenantID := "tenant-cruce"
+	dest := Destination{CVU: "0000003100020875666305"}
+
+	run := func(d domain.ExtractedReceiptData, file string) *domain.VerificationOutcome {
+		t.Helper()
+		uc := NewVerifyReceiptUseCase(repo, fixedExtractor(d), mp.NewMPClient(true))
+		out, err := uc.ExecuteAndAudit(ctx, tenantID, "549110", "wamid."+file, "T", dest, 120, []byte(file), "image/jpeg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	base := domain.ExtractedReceiptData{IsValidReceipt: true, IsCompletedTransfer: true, Amount: 353, SourceBankOrWallet: "Ualá",
+		SenderName: "Adrián Alberto Gómez", SenderCUIT: "20-38545266-8"}
+
+	// 1) Primer intento: comprobante adulterado
+	fake := base
+	fake.ReceiverAliasOrCVU = "0000003100020875666306"
+	if out := run(fake, "fake-1"); out.Status != domain.StatusFraudTampered || out.CustomerRisk == nil || out.CustomerRisk.PreviousFraud != 0 {
+		t.Fatalf("primer comprobante: %s %+v", out.Status, out.CustomerRisk)
+	}
+
+	// 2) El mismo cliente manda otro comprobante: se avisa que tiene un fraude registrado
+	second := base
+	second.Amount = 500
+	out := run(second, "segundo")
+	if out.CustomerRisk == nil || out.CustomerRisk.PreviousFraud != 1 || !out.CustomerRisk.HasWarnings() {
+		t.Fatalf("el segundo comprobante debía traer el fraude previo: %+v", out.CustomerRisk)
+	}
+	if lines := RiskWarnings(out.CustomerRisk); len(lines) == 0 || !strings.Contains(lines[0], "1 intento(s) de fraude") {
+		t.Fatalf("avisos: %v", lines)
+	}
+
+	// 3) Mismo CUIT con otro nombre: alerta de nombre editado
+	other := base
+	other.SenderName = "Carlos Pérez"
+	other.Amount = 700
+	out = run(other, "otro-nombre")
+	found := false
+	for _, n := range out.CustomerRisk.Notes {
+		found = found || strings.Contains(n, "figura antes a nombre de Adrián Alberto Gómez")
+	}
+	if !found {
+		t.Fatalf("faltó la alerta de CUIT con otro nombre: %+v", out.CustomerRisk.Notes)
+	}
+
+	// 4) Otra persona sin historial: sin alertas
+	clean := domain.ExtractedReceiptData{IsValidReceipt: true, IsCompletedTransfer: true, Amount: 900, SourceBankOrWallet: "Brubank",
+		SenderName: "Lucía Fernández", SenderCUIT: "27333333334"}
+	if out := run(clean, "limpio"); out.CustomerRisk.HasWarnings() {
+		t.Fatalf("un cliente sin historial no debía traer alertas: %+v", out.CustomerRisk)
+	}
+
+	// El nombre se compara sin acentos ni mayúsculas, y con nombres parciales
+	if !domain.SamePersonName("ADRIAN GOMEZ", "Adrián Alberto Gómez") || domain.SamePersonName("Carlos Pérez", "Adrián Gómez") {
+		t.Fatal("SamePersonName")
 	}
 }

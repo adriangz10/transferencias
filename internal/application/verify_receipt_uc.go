@@ -74,6 +74,7 @@ func (uc *VerifyReceiptUseCase) Execute(
 		return nil, err
 	}
 	if isDup {
+		out.AlreadySentAt = &prevTime
 		return finish(domain.StatusFraudDuplicateFile, fmt.Sprintf(
 			"🚨 *ALERTA DE FRAUDE (ARCHIVO REPETIDO)*\n\nEsta misma imagen/PDF ya se usó para validar una venta el *%s*.\n❌ *NO ENTREGAR EL PEDIDO.*",
 			prevTime.Format("02/01/2006 a las 15:04 hs"),
@@ -96,6 +97,7 @@ func (uc *VerifyReceiptUseCase) Execute(
 	if prev, found, err := uc.findVerifiedSameReceipt(ctx, tenantID, extracted); err != nil {
 		return nil, err
 	} else if found {
+		out.AlreadySentAt = &prev
 		return finish(domain.StatusFraudDuplicateFile, fmt.Sprintf(
 			"🚨 *COMPROBANTE REPETIDO*\n\nEste comprobante (operación *%s* por *$%.2f*) ya se usó para validar una venta el *%s*.\n❌ *NO ENTREGAR EL PEDIDO.*",
 			receiptIDFor(extracted), extracted.Amount, prev.Format("02/01/2006 a las 15:04 hs"),
@@ -109,9 +111,31 @@ func (uc *VerifyReceiptUseCase) Execute(
 
 	// 3. ESCUDO 3: el destinatario del comprobante debe ser el comercio (alias o CVU)
 	if checked, ok := MatchDestination(dest, extracted.ReceiverAliasOrCVU); checked && !ok {
+		// Un destino casi igual al del comercio (o un CVU que no existe) no es "otra cuenta":
+		// es un comprobante editado.
+		if tampered, why := DetectTamperedDestination(dest, extracted.ReceiverAliasOrCVU); tampered {
+			return finish(domain.StatusFraudTampered, fmt.Sprintf(
+				"🚨 *COMPROBANTE ADULTERADO*\n\nEl comprobante dice que se transfirió a *%s*, pero tu cuenta es *%s*: %s. Es la señal típica de un comprobante editado.\n❌ *NO ENTREGAR EL PEDIDO.*",
+				extracted.ReceiverAliasOrCVU, describeDestination(dest), why,
+			))
+		}
 		return finish(domain.StatusRejectedWrongDest, fmt.Sprintf(
 			"❌ *DESTINATARIO INCORRECTO*\n\nEl comprobante indica que se transfirió a *%s*, que no coincide con tu cuenta configurada (*%s*).",
 			extracted.ReceiverAliasOrCVU, describeDestination(dest),
+		))
+	}
+
+	// 3.B: el mismo comprobante reenviado en otro formato (PDF ↔ captura) cuando no se pudo leer
+	// su número de operación: misma persona, mismo monto y (si se ve) misma hora que una venta
+	// ya verificada. Se usa más abajo, solo si no aparece un pago nuevo que lo explique.
+	prevSame, prevSameByTime := uc.findVerifiedSameSender(ctx, tenantID, extracted)
+	alreadySent := func() (*domain.VerificationOutcome, error) {
+		at := prevSame.ValidatedAt
+		out.AlreadySentAt = &at
+		out.AlreadySentBySender = !prevSameByTime
+		return finish(domain.StatusFraudDuplicateFile, fmt.Sprintf(
+			"🔁 *COMPROBANTE YA ENVIADO*\n\nEste comprobante de *%s* por *$%.2f* ya se usó para validar una venta el *%s* (probablemente se envió antes como PDF o como captura).\n❌ *No es un pago nuevo: NO ENTREGAR otro pedido.*\n_Si el cliente hizo otra transferencia por el mismo monto, reenviá el comprobante cuando se acredite._",
+			senderLabel(extracted), extracted.Amount, at.Format("02/01/2006 a las 15:04 hs"),
 		))
 	}
 
@@ -180,6 +204,9 @@ func (uc *VerifyReceiptUseCase) Execute(
 	}
 
 	if strongID {
+		if prevSame != nil {
+			return alreadySent()
+		}
 		idDesc := opNumber
 		if coelsa != "" {
 			idDesc = "COELSA " + coelsa
@@ -191,6 +218,11 @@ func (uc *VerifyReceiptUseCase) Execute(
 	}
 
 	// 4.C: Comprobante SIN ID verificable: monto exacto + ventana de tiempo (+ CUIT si ambos lo informan)
+	// Si la hora del comprobante coincide con la de un pago ya asignado, es el mismo comprobante:
+	// no se le asigna otro pago aunque haya uno libre por el mismo monto.
+	if prevSame != nil && prevSameByTime {
+		return alreadySent()
+	}
 	syncRecentPayments()
 	out.MatchByAmount = true
 	p, err := uc.repo.ClaimPaymentByHeuristic(ctx, tenantID, extracted.Amount, timeWindowMinutes, extracted.SenderCUIT, out.ValidationID)
@@ -203,6 +235,9 @@ func (uc *VerifyReceiptUseCase) Execute(
 	}
 	if err != nil && !errors.Is(err, domain.ErrPaymentNotFound) {
 		return nil, err
+	}
+	if prevSame != nil {
+		return alreadySent()
 	}
 
 	return finish(domain.StatusRejectedNotFound, fmt.Sprintf(
@@ -224,9 +259,17 @@ func (uc *VerifyReceiptUseCase) resolveClaim(
 	switch {
 	case err == nil && p != nil:
 		out.MatchedPayment = p
+		clientName := strings.TrimSpace(extracted.SenderName)
+		if clientName == "" {
+			clientName = strings.TrimSpace(p.PayerName)
+		}
+		clientLine := ""
+		if clientName != "" {
+			clientLine = fmt.Sprintf("👤 *Cliente:* %s\n", clientName)
+		}
 		_, _ = finish(domain.StatusVerifiedExactID, fmt.Sprintf(
-			"✅ *TRANSFERENCIA VERIFICADA (100%% ID exacto)*\n\n💰 *Monto acreditado:* $%.2f\n🔑 *Comprobante:* %s\n🔢 *ID Mercado Pago:* #%d\n🏦 *Origen:* %s\n🕒 *Hora acreditación:* %s\n🔒 *Estado:* Bloqueado y asignado a esta venta.",
-			p.Amount, idDesc, p.MPPaymentID, extracted.SourceBankOrWallet, p.PaymentDate.Format("15:04:05 hs"),
+			"✅ *TRANSFERENCIA VERIFICADA (100%% ID exacto)*\n\n💰 *Monto acreditado:* $%.2f\n%s🔑 *Comprobante:* %s\n🔢 *ID Mercado Pago:* #%d\n🏦 *Origen:* %s\n🕒 *Hora acreditación:* %s\n🔒 *Estado:* Bloqueado y asignado a esta venta.",
+			p.Amount, clientLine, idDesc, p.MPPaymentID, extracted.SourceBankOrWallet, p.PaymentDate.Format("15:04:05 hs"),
 		))
 		return true, nil
 
@@ -306,15 +349,32 @@ func (uc *VerifyReceiptUseCase) ExecuteAndAudit(
 		valRecord.ExtractedReceiverAliasOrCBU = d.ReceiverAliasOrCVU
 		valRecord.ExtractedSourceBank = d.SourceBankOrWallet
 		valRecord.AIFraudWarnings = d.VisualManipulationNotes
-		if d.ReceiptTimestampISO != "" {
-			if t, err := time.Parse(time.RFC3339, d.ReceiptTimestampISO); err == nil {
-				valRecord.ExtractedDate = &t
-			}
+		if t, ok := domain.ParseReceiptTimestamp(d.ReceiptTimestampISO); ok {
+			valRecord.ExtractedDate = &t
 		}
 	}
 
 	if outcome.MatchedPayment != nil {
 		valRecord.MatchedMPPaymentID = outcome.MatchedPayment.ID
+	}
+
+	// Cruce con el historial del cliente (antes de guardar este comprobante, así cuenta lo anterior)
+	if d := outcome.ExtractedData; d != nil && d.IsValidReceipt {
+		customer, err := uc.repo.UpsertCustomer(ctx, tenantID, d.SenderCUIT, d.SenderName, "", time.Now())
+		if err != nil {
+			log.Printf("⚠️ No se pudo registrar al cliente del comprobante %s: %v", outcome.ValidationID, err)
+		} else if customer != nil {
+			valRecord.CustomerID = customer.ID
+			outcome.CustomerRisk = uc.assessCustomerRisk(ctx, tenantID, customer, outcome)
+			if lines := RiskWarnings(outcome.CustomerRisk); len(lines) > 0 {
+				outcome.MessageForUser += "\n\n" + strings.Join(lines, "\n")
+			}
+			if outcome.MatchedPayment != nil {
+				if err := uc.repo.LinkPaymentCustomer(ctx, tenantID, outcome.MatchedPayment.ID, customer.ID); err != nil {
+					log.Printf("⚠️ No se pudo asociar el pago al cliente: %v", err)
+				}
+			}
+		}
 	}
 
 	// El archivo duplicado no se audita ni consume cuota (se corta antes de gastar IA)
@@ -328,6 +388,56 @@ func (uc *VerifyReceiptUseCase) ExecuteAndAudit(
 	}
 
 	return outcome, nil
+}
+
+// riskWindow es el período en el que se cuentan los rechazos recientes de un cliente.
+const riskWindow = 24 * time.Hour
+
+// assessCustomerRisk cruza el comprobante con el historial del cliente y con el pago de MP.
+func (uc *VerifyReceiptUseCase) assessCustomerRisk(ctx context.Context, tenantID string, c *domain.Customer, out *domain.VerificationOutcome) *domain.CustomerRisk {
+	risk := &domain.CustomerRisk{CustomerID: c.ID}
+	fraud, last, recent, err := uc.repo.CustomerRiskStats(ctx, tenantID, c.ID, time.Now().Add(-riskWindow))
+	if err != nil {
+		log.Printf("⚠️ No se pudo consultar el historial del cliente %s: %v", c.ID, err)
+	} else {
+		risk.PreviousFraud, risk.LastFraudAt, risk.RecentFailures = fraud, last, recent
+	}
+
+	d := out.ExtractedData
+	cuit := domain.NormalizeCUIT(d.SenderCUIT)
+	// El mismo CUIT apareció antes con otro nombre: el nombre del comprobante pudo ser editado
+	if cuit != "" && c.Name != "" && strings.TrimSpace(d.SenderName) != "" && !domain.SamePersonName(c.Name, d.SenderName) {
+		risk.Notes = append(risk.Notes, fmt.Sprintf("El CUIT %s figura antes a nombre de %s, no de %s.", cuit, c.Name, strings.TrimSpace(d.SenderName)))
+	}
+	// El CUIT del comprobante no es el del pagador que informa Mercado Pago
+	if p := out.MatchedPayment; p != nil && cuit != "" {
+		if payer := domain.NormalizeCUIT(p.PayerCUIT); payer != "" && payer != cuit {
+			risk.Notes = append(risk.Notes, fmt.Sprintf("El CUIT del comprobante (%s) no coincide con el del pagador en Mercado Pago (%s).", cuit, payer))
+		}
+	}
+	return risk
+}
+
+// RiskWarnings arma los avisos del cruce con el historial del cliente.
+func RiskWarnings(r *domain.CustomerRisk) []string {
+	if !r.HasWarnings() {
+		return nil
+	}
+	var out []string
+	if r.PreviousFraud > 0 {
+		when := ""
+		if r.LastFraudAt != nil {
+			when = " (el último el " + r.LastFraudAt.Local().Format("02/01") + ")"
+		}
+		out = append(out, fmt.Sprintf("⚠️ Este cliente tiene %d intento(s) de fraude registrados%s.", r.PreviousFraud, when))
+	}
+	if r.RecentFailures >= domain.RecentFailuresAlert {
+		out = append(out, fmt.Sprintf("⚠️ %d comprobantes rechazados de este cliente en las últimas 24 h.", r.RecentFailures))
+	}
+	for _, n := range r.Notes {
+		out = append(out, "⚠️ "+n)
+	}
+	return out
 }
 
 // NormalizeCoelsa quita espacios/saltos de línea y pasa a mayúsculas un ID COELSA.
@@ -365,6 +475,96 @@ func (uc *VerifyReceiptUseCase) findVerifiedSameReceipt(ctx context.Context, ten
 		}
 	}
 	return time.Time{}, false, nil
+}
+
+// sameReceiptLookback es hasta cuánto atrás se busca una venta verificada con el mismo comprobante.
+const sameReceiptLookback = 72 * time.Hour
+
+// Diferencia máxima de hora para considerar que es la misma transferencia:
+//   - entre dos copias del comprobante (PDF y captura muestran la misma hora, a veces sin segundos);
+//   - entre la hora del comprobante y la acreditación en MP (suele ser de segundos).
+const (
+	sameReceiptTimeTolerance = 2 * time.Minute
+	samePaymentTimeTolerance = 5 * time.Minute
+)
+
+// findVerifiedSameSender busca una venta ya verificada con el mismo monto y la misma persona
+// (CUIT, o nombre si falta el CUIT). Si el comprobante muestra la hora:
+//   - coincide con la de esa venta → byTime=true (es seguro el mismo comprobante);
+//   - es otra hora → no se considera el mismo comprobante (es otra transferencia).
+//
+// Sin hora legible, la coincidencia queda como probable (byTime=false).
+func (uc *VerifyReceiptUseCase) findVerifiedSameSender(ctx context.Context, tenantID string, e *domain.ExtractedReceiptData) (*domain.VerifiedReceiptRef, bool) {
+	cuit := digitsOnly(e.SenderCUIT)
+	name := domain.NormalizePersonName(e.SenderName)
+	if e.Amount <= 0 || (cuit == "" && name == "") {
+		return nil, false
+	}
+	refs, err := uc.repo.ListRecentVerifiedByAmount(ctx, tenantID, e.Amount, time.Now().Add(-sameReceiptLookback))
+	if err != nil {
+		log.Printf("⚠️ No se pudo buscar comprobantes ya verificados: %v", err)
+		return nil, false
+	}
+	receiptTime, hasTime := domain.ParseReceiptTimestamp(e.ReceiptTimestampISO)
+
+	var probable *domain.VerifiedReceiptRef
+	for i := range refs {
+		ref := &refs[i]
+		if !samePerson(cuit, name, ref) {
+			continue
+		}
+		if !hasTime {
+			if probable == nil {
+				probable = ref
+			}
+			continue
+		}
+		matched, conflict := false, false
+		for _, c := range []struct {
+			t   *time.Time
+			tol time.Duration
+		}{{ref.ReceiptTime, sameReceiptTimeTolerance}, {ref.PaymentDate, samePaymentTimeTolerance}} {
+			if c.t == nil || c.t.IsZero() {
+				continue
+			}
+			diff := receiptTime.Sub(*c.t)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff <= c.tol {
+				matched = true
+			} else {
+				conflict = true
+			}
+		}
+		switch {
+		case matched:
+			return ref, true
+		case !conflict && probable == nil:
+			probable = ref // la venta anterior no tiene hora para comparar
+		}
+	}
+	return probable, false
+}
+
+// samePerson compara el emisor del comprobante con el de una venta ya verificada.
+// Si ambos tienen CUIT manda el CUIT; si no, se compara el nombre.
+func samePerson(cuit, name string, ref *domain.VerifiedReceiptRef) bool {
+	refCUITs := []string{digitsOnly(ref.SenderCUIT), digitsOnly(ref.PayerCUIT)}
+	if cuit != "" && (refCUITs[0] != "" || refCUITs[1] != "") {
+		return cuit == refCUITs[0] || cuit == refCUITs[1]
+	}
+	return name != "" && name == domain.NormalizePersonName(ref.SenderName)
+}
+
+func senderLabel(e *domain.ExtractedReceiptData) string {
+	if n := strings.TrimSpace(e.SenderName); n != "" {
+		return n
+	}
+	if c := strings.TrimSpace(e.SenderCUIT); c != "" {
+		return "CUIT " + c
+	}
+	return "este cliente"
 }
 
 // normalizeReceiptID deja solo letras y números en mayúsculas.
@@ -522,6 +722,92 @@ func MatchDestination(dest Destination, receiver string) (checked bool, ok bool)
 		}
 	}
 	return checked, !checked
+}
+
+// DetectTamperedDestination se usa cuando el destino NO coincide con el comercio. Indica si
+// parece un comprobante editado en lugar de una transferencia a otra cuenta:
+//   - el CBU/CVU es casi igual al del comercio (1 o 2 dígitos distintos);
+//   - el CBU/CVU completo no pasa los dígitos verificadores (esa cuenta no existe);
+//   - el alias es casi igual al del comercio (1 o 2 letras distintas).
+func DetectTamperedDestination(dest Destination, receiver string) (bool, string) {
+	alias := strings.ToLower(strings.TrimSpace(dest.Alias))
+	cvu := digitsOnly(dest.CVU)
+	tokens := strings.FieldsFunc(strings.ToLower(receiver), func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(",;/|:()[]", r)
+	})
+	for _, tok := range tokens {
+		tok = strings.Trim(tok, ".")
+		if tok == "" || destinationLabels[tok] {
+			continue
+		}
+		if isCVUToken(tok) {
+			clean := strings.ReplaceAll(tok, "-", "")
+			if len(cvu) == 22 && len(clean) == 22 {
+				if d := maskedDiff(clean, cvu); d >= 1 && d <= 2 {
+					return true, fmt.Sprintf("el CVU es igual al tuyo salvo %d dígito(s)", d)
+				}
+			}
+			if len(clean) == 22 && digitsOnly(clean) == clean && !ValidCBU(clean) {
+				return true, "ese CVU/CBU no es válido (no pasa los dígitos verificadores)"
+			}
+			continue
+		}
+		if len(alias) >= 6 && isAliasLike(tok) && tok != alias {
+			if d := editDistance(tok, alias); d <= 2 {
+				return true, fmt.Sprintf("el alias es igual al tuyo salvo %d letra(s)", d)
+			}
+		}
+	}
+	return false, ""
+}
+
+// maskedDiff cuenta las posiciones distintas, ignorando las enmascaradas (*, x, •).
+func maskedDiff(tok, cvu string) int {
+	d := 0
+	for i := 0; i < len(tok) && i < len(cvu); i++ {
+		if !isMaskRune(rune(tok[i])) && tok[i] != cvu[i] {
+			d++
+		}
+	}
+	return d
+}
+
+// ValidCBU verifica los dos dígitos verificadores de un CBU/CVU de 22 dígitos.
+func ValidCBU(c string) bool {
+	if len(c) != 22 || digitsOnly(c) != c {
+		return false
+	}
+	check := func(block string, weights []int) int {
+		sum := 0
+		for i := range block {
+			sum += int(block[i]-'0') * weights[i%len(weights)]
+		}
+		return (10 - sum%10) % 10
+	}
+	w1 := []int{7, 1, 3, 9}
+	w2 := []int{3, 9, 7, 1}
+	return check(c[0:7], w1) == int(c[7]-'0') && check(c[8:21], w2) == int(c[21]-'0')
+}
+
+// editDistance es la distancia de Levenshtein entre dos textos cortos.
+func editDistance(a, b string) int {
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(b)]
 }
 
 func isAliasLike(tok string) bool {

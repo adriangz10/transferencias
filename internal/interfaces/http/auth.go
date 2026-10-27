@@ -162,9 +162,8 @@ func (h *WebhooksHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(loginHTML)
+		// La pantalla de login es parte de la app de Angular
+		servePanelIndex(w, r)
 	case http.MethodPost:
 		if h.cfg.AdminPassword == "" {
 			http.Error(w, "Panel deshabilitado: configurá ADMIN_PASSWORD", http.StatusServiceUnavailable)

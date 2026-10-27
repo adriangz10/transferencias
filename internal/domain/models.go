@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"math"
+	"strings"
 	"time"
 )
 
@@ -10,6 +11,7 @@ var (
 	ErrPaymentAlreadyConsumed = errors.New("el pago ya fue consumido previamente por otro comprobante")
 	ErrPaymentNotFound        = errors.New("no se encontró un pago acreditado disponible")
 	ErrPaymentAmountMismatch  = errors.New("el pago existe pero el monto no coincide con el comprobante")
+	ErrValidationNotFound     = errors.New("el comprobante no existe")
 )
 
 // ChargeOrderIDPrefix identifica en consumed_by_receipt_id los pagos tomados por una orden /cobrar.
@@ -37,6 +39,9 @@ const (
 	StatusFraudIncomplete     ValidationStatus = "FRAUD_INCOMPLETE_TRANSFER"
 	StatusInvalidReceiptImage ValidationStatus = "INVALID_RECEIPT_IMAGE"
 	StatusRejectedAmountDiff  ValidationStatus = "REJECTED_AMOUNT_MISMATCH"
+	// StatusFraudTampered: el comprobante fue editado (ej. el CVU de destino es casi igual al
+	// del comercio, con uno o dos dígitos cambiados). No es una transferencia a otra cuenta.
+	StatusFraudTampered ValidationStatus = "FRAUD_TAMPERED_RECEIPT"
 
 	// StatusQuotaExceeded no se persiste: solo se informa al empleado.
 	StatusQuotaExceeded ValidationStatus = "QUOTA_EXCEEDED"
@@ -79,6 +84,8 @@ type MPPayment struct {
 	OperationType        string     `json:"operation_type"`
 	PayerCUIT            string     `json:"payer_cuit"`
 	PayerName            string     `json:"payer_name"`
+	PayerEmail           string     `json:"payer_email,omitempty"`
+	CustomerID           string     `json:"customer_id,omitempty"` // cliente al que pertenece el pago (si se pudo identificar)
 	CoelsaID             string     `json:"coelsa_id"`
 	PaymentDate          time.Time  `json:"payment_date"`
 	ReconciliationStatus string     `json:"reconciliation_status"` // "AVAILABLE" | "CONSUMED" | "DISPUTED"
@@ -107,6 +114,14 @@ type VerificationOutcome struct {
 
 	// true si el pago ya había sido conciliado por una orden /cobrar (no es fraude en sí mismo)
 	ConsumedByChargeOrder bool `json:"consumed_by_charge_order,omitempty"`
+
+	// Cruce con el historial del cliente (se calcula antes de guardar este comprobante)
+	CustomerRisk *CustomerRisk `json:"customer_risk,omitempty"`
+
+	// Cuándo se validó antes este mismo comprobante (reenvío del PDF como captura o al revés).
+	AlreadySentAt *time.Time `json:"already_sent_at,omitempty"`
+	// true si se reconoció por emisor + monto sin poder confirmar la hora (puede ser otra transferencia)
+	AlreadySentBySender bool `json:"already_sent_by_sender,omitempty"`
 }
 
 // PlanType define los planes comerciales B2B de VeriPago SaaS (Sección 1.3)
@@ -253,8 +268,50 @@ type ReceiptValidation struct {
 	AIFraudWarnings             []string         `json:"ai_fraud_warnings"`
 	ValidationResult            ValidationStatus `json:"validation_result"`
 	MatchedMPPaymentID          string           `json:"matched_mp_payment_id,omitempty"`
+	CustomerID                  string           `json:"customer_id,omitempty"`
 	ProcessingTimeMs            int              `json:"processing_time_ms"`
 	CreatedAt                   time.Time        `json:"created_at"`
+}
+
+// ValidationFilter filtra y pagina el historial de comprobantes del panel.
+type ValidationFilter struct {
+	From, To   *time.Time         // rango de fechas [From, To)
+	Statuses   []ValidationStatus // vacío = todos
+	CustomerID string             // vacío = todos los clientes
+	Limit      int
+	Offset     int
+}
+
+// VerifiedReceiptRef resume una validación ya verificada, para detectar el mismo comprobante
+// reenviado en otro formato (PDF y captura) aunque no se haya podido leer su número de operación.
+type VerifiedReceiptRef struct {
+	ValidatedAt time.Time
+	SenderCUIT  string
+	SenderName  string
+	ReceiptTime *time.Time // fecha/hora leída del comprobante, si se pudo
+	PaymentDate *time.Time // hora en que acreditó el pago de MP asignado
+	PayerCUIT   string     // CUIT del pagador según Mercado Pago
+}
+
+// argentinaTZ es la hora de Argentina (UTC-3, sin horario de verano).
+var argentinaTZ = time.FixedZone("ART", -3*60*60)
+
+// ParseReceiptTimestamp interpreta la fecha/hora leída del comprobante. Si no trae zona
+// horaria se asume hora de Argentina, que es la que muestran los comprobantes.
+func ParseReceiptTimestamp(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, true
+	}
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04", "2006-01-02 15:04:05", "2006-01-02 15:04"} {
+		if t, err := time.ParseInLocation(layout, s, argentinaTZ); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // PendingReceiptQueueItem representa un comprobante en la Cola de Espera Reactiva (Redis 3 min TTL)
@@ -293,4 +350,141 @@ type UniqueChargeOrder struct {
 	CreatedAt      time.Time  `json:"created_at"`
 	ExpiresAt      time.Time  `json:"expires_at"`
 	PaidAt         *time.Time `json:"paid_at,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Clientes (quienes transfieren al comercio)
+// ---------------------------------------------------------------------------
+
+// Customer es una persona que le transfirió (o intentó transferir) al comercio. Se identifica por
+// CUIT; si no se conoce, por el nombre normalizado.
+type Customer struct {
+	ID          string    `json:"id"`
+	TenantID    string    `json:"tenant_id"`
+	IdentityKey string    `json:"-"`
+	CUIT        string    `json:"cuit,omitempty"`
+	Name        string    `json:"name"`
+	NameKey     string    `json:"-"`
+	Email       string    `json:"email,omitempty"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+}
+
+// CustomerStats son los totales del historial de un cliente (se calculan con consultas, no se guardan).
+type CustomerStats struct {
+	Receipts       int        `json:"receipts"`
+	Verified       int        `json:"verified"`
+	Fraud          int        `json:"fraud"`
+	Rejected       int        `json:"rejected"`
+	NotFound       int        `json:"not_found"`
+	VerifiedAmount float64    `json:"verified_amount"`
+	Payments       int        `json:"payments"`
+	LastFraudAt    *time.Time `json:"last_fraud_at,omitempty"`
+}
+
+// CustomerSummary es un cliente con sus totales, para el panel.
+type CustomerSummary struct {
+	Customer
+	CustomerStats
+}
+
+// CustomerFilter busca y pagina clientes.
+type CustomerFilter struct {
+	Query     string // nombre o CUIT
+	OnlyFraud bool   // solo clientes con algún intento de fraude
+	Limit     int
+	Offset    int
+}
+
+// CustomerRisk es el resultado de cruzar un comprobante con el historial de su cliente.
+type CustomerRisk struct {
+	CustomerID     string     `json:"customer_id"`
+	PreviousFraud  int        `json:"previous_fraud"`
+	LastFraudAt    *time.Time `json:"last_fraud_at,omitempty"`
+	RecentFailures int        `json:"recent_failures"` // rechazos y fraudes en las últimas 24 h
+	// Alertas en texto: CUIT con otro nombre, CUIT distinto al del pagador en MP, etc.
+	Notes []string `json:"notes,omitempty"`
+}
+
+// HasWarnings indica si hay algo que avisar al comercio.
+func (r *CustomerRisk) HasWarnings() bool {
+	return r != nil && (r.PreviousFraud > 0 || r.RecentFailures >= RecentFailuresAlert || len(r.Notes) > 0)
+}
+
+// DefaultTimeWindowMinutes es la ventana inicial para buscar pagos sin número de operación.
+const DefaultTimeWindowMinutes = 120
+
+// RecentFailuresAlert: a partir de cuántos rechazos en 24 h se avisa.
+const RecentFailuresAlert = 2
+
+// FraudStatuses son los resultados que cuentan como intento de fraude en el historial.
+var FraudStatuses = []ValidationStatus{
+	StatusFraudTampered, StatusFraudDuplicateFile, StatusFraudAlreadyUsed, StatusFraudIncomplete, StatusRejectedAmountDiff,
+}
+
+// IsFraudStatus indica si el resultado es un intento de fraude.
+func IsFraudStatus(s ValidationStatus) bool {
+	for _, f := range FraudStatuses {
+		if f == s {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeCUIT deja solo los dígitos; devuelve "" si no son 11.
+func NormalizeCUIT(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() != 11 {
+		return ""
+	}
+	return b.String()
+}
+
+// NormalizePersonName pasa a minúsculas, quita acentos y espacios de más. Sirve para comparar
+// "Adrián  Gómez" con "ADRIAN GOMEZ".
+func NormalizePersonName(s string) string {
+	r := strings.NewReplacer("á", "a", "é", "e", "í", "i", "ó", "o", "ú", "u", "ü", "u", "ñ", "n",
+		"Á", "a", "É", "e", "Í", "i", "Ó", "o", "Ú", "u", "Ü", "u", "Ñ", "n")
+	return strings.Join(strings.Fields(strings.ToLower(r.Replace(s))), " ")
+}
+
+// CustomerIdentityKey identifica a un cliente dentro del comercio: por CUIT si lo hay, si no por
+// nombre. Devuelve "" si no hay datos suficientes.
+func CustomerIdentityKey(cuit, name string) string {
+	if c := NormalizeCUIT(cuit); c != "" {
+		return "CUIT:" + c
+	}
+	if n := NormalizePersonName(name); len(n) >= 3 {
+		return "NAME:" + n
+	}
+	return ""
+}
+
+// SamePersonName indica si dos nombres son compatibles (iguales, o uno contiene al otro, como
+// "Adrian Gomez" y "Adrian Alberto Gomez").
+func SamePersonName(a, b string) bool {
+	a, b = NormalizePersonName(a), NormalizePersonName(b)
+	if a == "" || b == "" || a == b {
+		return true
+	}
+	wa, wb := strings.Fields(a), strings.Fields(b)
+	if len(wa) > len(wb) {
+		wa, wb = wb, wa
+	}
+	set := map[string]bool{}
+	for _, w := range wb {
+		set[w] = true
+	}
+	for _, w := range wa {
+		if !set[w] {
+			return false
+		}
+	}
+	return true
 }

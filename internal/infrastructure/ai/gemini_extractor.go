@@ -93,7 +93,9 @@ REGLAS CRÍTICAS DE EXTRACCIÓN Y DETECCIÓN DE FRAUDE:
 4. coelsa_id: Es el identificador interbancario de la transferencia. Según el banco figura como "ID Operación" (Brubank), "Código de identificación", "ID COELSA" o "ID de transacción". Suele tener 22 caracteres alfanuméricos en mayúsculas (ej: "1LMP68NKK4DW4WEPNR7OEV") o 19 dígitos. Extráelo completo, sin espacios ni saltos de línea aunque esté partido en dos renglones. NO lo confundas con el "Número de transacción" interno del banco (ej: 10 dígitos en Brubank). Un código con guiones tipo UUID (ej: "74caca65-b680-bdb0-fe3c-9fe207dd3ff0", habitual en Ualá) NUNCA es COELSA: en ese caso deja coelsa_id vacío y pon ese código en operation_number.
 5. sender_cuit: Extrae el CUIT/CUIL de quien envía el dinero solo con dígitos (sin guiones).
 6. receiver_alias_or_cvu: Extrae el Alias, CBU o CVU del destinatario para verificar que le hayan transferido al comercio correcto.
-7. visual_manipulation_notes: Si notas tipografías de distinto tamaño o fuente en el monto respecto del resto del texto, recortes sospechosos o bordes desalineados típicos de edición o apps falsas ("MP Fake"), descríbelo en este array.`
+7. receipt_timestamp_iso: Fecha y hora de la transferencia tal como figura en el comprobante (hora de Argentina), en formato "AAAA-MM-DDTHH:MM:SS-03:00" (ej: "26/10/2026 20:55 hs" -> "2026-10-26T20:55:00-03:00"). Si no figuran los segundos usa 00. Déjalo vacío solo si el comprobante no muestra fecha.
+8. El mismo comprobante puede llegar como PDF o como captura de pantalla del PDF: extrae SIEMPRE los mismos datos (en especial coelsa_id, operation_number y receipt_timestamp_iso) sin importar el formato. Revisa todo el comprobante, incluso la parte inferior, antes de dejar un ID vacío.
+9. visual_manipulation_notes: Si notas tipografías de distinto tamaño o fuente en el monto respecto del resto del texto, recortes sospechosos o bordes desalineados típicos de edición o apps falsas ("MP Fake"), descríbelo en este array.`
 
 func (g *GeminiReceiptExtractor) ExtractFromMedia(ctx context.Context, fileBytes []byte, mimeType string) (*domain.ExtractedReceiptData, error) {
 	if g.mockFunc != nil {
@@ -275,8 +277,6 @@ func fallbackExtractFromBytes(fileBytes []byte, mimeType string) *domain.Extract
 		SourceBankOrWallet:      "Mercado Pago (Modo Demo Local)",
 		SenderName:              "Juan Ignacio Perez",
 		SenderCUIT:              "20348912349",
-		ReceiverName:            "Pizzeria Don Mateo SRL",
-		ReceiverAliasOrCVU:      "don.mateo.mp",
 		ReceiptTimestampISO:     time.Now().Format(time.RFC3339),
 		VisualManipulationNotes: []string{},
 	}

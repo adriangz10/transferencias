@@ -49,21 +49,35 @@ func main() {
 		log.Fatalf("Error inicializando TokenVault AES-256-GCM: %v", err)
 	}
 
-	// 2. MySQL: crear la base si no existe, migrar y conectar
-	activeDB, dbErr := connectMySQL(ctx, cfg)
-	if dbErr != nil {
-		if !cfg.DemoMode {
-			log.Fatalf("❌ MySQL no disponible (%v). Fuera del modo demo no se arranca sin base de datos: se perdería la protección contra doble uso.", dbErr)
+	// 2. MySQL: crear la base si no existe, migrar y conectar.
+	// El modo demo trabaja SOLO en memoria: los pagos simulados nunca se mezclan con datos reales.
+	var activeDB *sql.DB
+	if cfg.DemoMode {
+		log.Printf("ℹ️ Modo demo: base de datos y cola en memoria (se borran al reiniciar)")
+	} else {
+		db, err := connectMySQL(ctx, cfg)
+		if err != nil {
+			log.Fatalf("❌ MySQL no disponible (%v). No se arranca sin base de datos: se perdería la protección contra doble uso.", err)
 		}
-		log.Printf("⚠️ MySQL no disponible (%v) — modo demo: usando almacenamiento en memoria (se pierde al reiniciar)", dbErr)
+		activeDB = db
 	}
 	repo := persistence.NewMySQLRepository(activeDB)
 
+	// Comercio de esta instalación: se lee de la base (o se crea vacío; los datos se cargan en el panel)
+	tenant, err := repo.EnsureTenant(ctx)
+	if err != nil {
+		log.Fatalf("❌ No se pudo leer el comercio: %v", err)
+	}
+
 	// 3. Redis (Cola de Espera Reactiva y órdenes /cobrar)
-	queueStore := queue.NewRedisQueueStore(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	redisAddr := cfg.RedisAddr
+	if cfg.DemoMode {
+		redisAddr = "" // en memoria
+	}
+	queueStore := queue.NewRedisQueueStore(redisAddr, cfg.RedisPassword, cfg.RedisDB)
 	if queueStore.IsUsingRedis() {
 		log.Printf("✅ Conectado a Redis en %s", cfg.RedisAddr)
-	} else {
+	} else if !cfg.DemoMode {
 		log.Printf("⚠️ Redis no disponible en %s — la Cola de Espera y las órdenes /cobrar quedan en memoria (se pierden al reiniciar)", cfg.RedisAddr)
 	}
 
@@ -82,24 +96,12 @@ func main() {
 	mpClient := mp.NewMPClient(cfg.DemoMode)
 	waClient := whatsapp.NewClient(cfg.WAAccessToken, cfg.WAPhoneNumberID)
 
-	// 6. Datos de demostración SOLO en modo demo. Fuera de él, se desactiva la cuenta MP demo
-	// que pudo haber quedado de arranques anteriores para que no tape a la cuenta real.
-	if cfg.DemoMode {
-		encAccess, _ := vault.Encrypt("DEMO_MP_ACCESS_TOKEN_DON_MATEO")
-		encRefresh, _ := vault.Encrypt("DEMO_MP_REFRESH_TOKEN_DON_MATEO")
-		if err := repo.SeedDefaultDemoData(ctx, encAccess, encRefresh, cfg.MPWebhookSecret); err != nil {
-			log.Printf("Advertencia sembrando datos de demostración: %v", err)
-		}
-	} else if err := repo.RevokeDemoMPAccount(ctx); err != nil {
-		log.Printf("⚠️ No se pudo desactivar la cuenta MP de demostración: %v", err)
-	}
-
 	// 7. Caso de uso principal de conciliación y antifraude
 	verifyUC := application.NewVerifyReceiptUseCase(repo, extractor, mpClient)
 
 	// 8. Router HTTP
 	mux := http.NewServeMux()
-	webhooksHandler := httpInterface.NewWebhooksHandler(cfg, repo, vault, extractor, mpClient, waClient, queueStore, verifyUC)
+	webhooksHandler := httpInterface.NewWebhooksHandler(cfg, repo, vault, extractor, mpClient, waClient, queueStore, verifyUC, tenant.ID)
 	webhooksHandler.RegisterRoutes(mux)
 	webhooksHandler.StartBackgroundJobs()
 
