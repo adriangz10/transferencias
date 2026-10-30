@@ -401,10 +401,115 @@ func mapRawMPToDomain(tenantID string, rawJSON []byte) (*domain.MPPayment, error
 		OperationType:        parsed.OperationType,
 		PayerCUIT:            parsed.Payer.Identification.Number,
 		PayerName:            strings.TrimSpace(fmt.Sprintf("%s %s", parsed.Payer.FirstName, parsed.Payer.LastName)),
-		PayerEmail:           strings.TrimSpace(parsed.Payer.Email),
+		PayerEmail:           strings.TrimSpace(fmt.Sprintf("%s", parsed.Payer.Email)),
 		CoelsaID:             parsed.PointOfInteraction.TransactionData.E2EID,
 		PaymentDate:          payDate,
 		ReconciliationStatus: "AVAILABLE",
 		RawJSON:              rawJSON,
 	}, nil
+}
+
+// CreateSubscriptionPreference crea una preferencia de Checkout Pro en Mercado Pago para cobrar una suscripción del SaaS.
+func (c *MPClient) CreateSubscriptionPreference(
+	ctx context.Context,
+	platformAccessToken string,
+	orderID string,
+	title string,
+	amountARS float64,
+	payerEmail string,
+	publicBaseURL string,
+) (prefID string, initPoint string, err error) {
+	if c.demoMode || strings.HasPrefix(platformAccessToken, "DEMO_") {
+		return "PREF_DEMO_" + orderID, publicBaseURL + "/configuracion?sub_demo=" + orderID, nil
+	}
+	if platformAccessToken == "" {
+		return "", "", fmt.Errorf("MP_PLATFORM_ACCESS_TOKEN no configurado")
+	}
+
+	payload := map[string]interface{}{
+		"items": []map[string]interface{}{
+			{
+				"id":          orderID,
+				"title":       title,
+				"quantity":    1,
+				"currency_id": "ARS",
+				"unit_price":  amountARS,
+			},
+		},
+		"external_reference": "sub_" + orderID,
+		"back_urls": map[string]string{
+			"success": publicBaseURL + "/configuracion?sub=success&order=" + orderID,
+			"failure": publicBaseURL + "/configuracion?sub=failure&order=" + orderID,
+			"pending": publicBaseURL + "/configuracion?sub=pending&order=" + orderID,
+		},
+		"auto_return":      "approved",
+		"notification_url": publicBaseURL + "/webhooks/mercadopago/platform",
+	}
+	if payerEmail != "" {
+		payload["payer"] = map[string]string{"email": payerEmail}
+	}
+
+	bodyBytes, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.mercadopago.com/checkout/preferences", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+platformAccessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("MP Checkout Preferences devolvió status %d: %s", resp.StatusCode, string(b))
+	}
+
+	var prefResp struct {
+		ID        string `json:"id"`
+		InitPoint string `json:"init_point"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&prefResp); err != nil {
+		return "", "", err
+	}
+	return prefResp.ID, prefResp.InitPoint, nil
+}
+
+// PlatformPaymentInfo contiene los datos clave de un pago recibido en la cuenta de la plataforma SaaS.
+type PlatformPaymentInfo struct {
+	ID                int64   `json:"id"`
+	Status            string  `json:"status"`
+	TransactionAmount float64 `json:"transaction_amount"`
+	ExternalReference string  `json:"external_reference"`
+}
+
+// GetPlatformPayment consulta un pago en la cuenta de Mercado Pago de la plataforma SaaS.
+func (c *MPClient) GetPlatformPayment(ctx context.Context, platformAccessToken string, paymentID string) (*PlatformPaymentInfo, error) {
+	if platformAccessToken == "" {
+		return nil, fmt.Errorf("MP_PLATFORM_ACCESS_TOKEN vacío")
+	}
+	endpoint := fmt.Sprintf("https://api.mercadopago.com/v1/payments/%s", url.PathEscape(paymentID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+platformAccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("MP API devolvió status %d", resp.StatusCode)
+	}
+	var info PlatformPaymentInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, err
+	}
+	return &info, nil
 }

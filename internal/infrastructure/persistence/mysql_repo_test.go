@@ -150,4 +150,51 @@ func TestMySQLMigrationsAndQueries(t *testing.T) {
 	if _, err := repo.DeleteReceiptValidation(ctx, tenantID, page[0].ID); err != nil {
 		t.Fatalf("DeleteReceiptValidation: %v", err)
 	}
+
+	// Multi-Tenant SaaS (migración 0006): alta de comercio, login por email y suscripciones
+	mtEmail := "test-" + uuid.NewString()[:8] + "@comercio.ar"
+	mtTenant := &domain.Tenant{
+		BusinessName:       "Comercio SaaS Test",
+		Email:              mtEmail,
+		PasswordHash:       "$2a$10$testhashtesthashtesthashtesthashtesthashtesthashtest",
+		PlanType:           domain.PlanFreeTrial,
+		SubscriptionStatus: "TRIAL",
+		MonthlyQuota:       50,
+		TimeWindowMinutes:  120,
+		IsActive:           true,
+	}
+	if err := repo.CreateTenant(ctx, mtTenant); err != nil {
+		t.Fatalf("CreateTenant: %v", err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), `DELETE FROM tenants WHERE id = ?`, mtTenant.ID)
+	}()
+
+	byEmail, err := repo.GetTenantByEmail(ctx, mtEmail)
+	if err != nil || byEmail == nil || byEmail.ID != mtTenant.ID {
+		t.Fatalf("GetTenantByEmail: %+v %v", byEmail, err)
+	}
+
+	subOrd := &domain.SubscriptionOrder{
+		ID:        uuid.NewString(),
+		TenantID:  mtTenant.ID,
+		PlanType:  domain.PlanPro,
+		AmountARS: 33600,
+		PriceUSD:  28,
+		Status:    "PENDING",
+	}
+	if err := repo.CreateSubscriptionOrder(ctx, subOrd); err != nil {
+		t.Fatalf("CreateSubscriptionOrder: %v", err)
+	}
+	approvedOrd, err := repo.ApproveSubscriptionOrder(ctx, subOrd.ID, 123456789)
+	if err != nil || approvedOrd.Status != "APPROVED" {
+		t.Fatalf("ApproveSubscriptionOrder: %+v %v", approvedOrd, err)
+	}
+	afterSub, err := repo.GetTenantByID(ctx, mtTenant.ID)
+	if err != nil || afterSub.PlanType != domain.PlanPro || afterSub.SubscriptionStatus != "ACTIVE" || afterSub.MonthlyQuota != 1500 {
+		t.Fatalf("el comercio debía pasar a PRO ACTIVE: %+v %v", afterSub, err)
+	}
+	if _, stats, err := repo.ListTenantsAdmin(ctx, "Comercio SaaS Test"); err != nil || stats.TotalTenants < 1 {
+		t.Fatalf("ListTenantsAdmin: stats=%+v err=%v", stats, err)
+	}
 }

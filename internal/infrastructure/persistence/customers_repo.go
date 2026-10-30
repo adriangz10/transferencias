@@ -513,6 +513,17 @@ func (r *MySQLRepository) UpdateTenantProfile(ctx context.Context, tenantID, bus
 	if r.db == nil {
 		r.mem.mu.Lock()
 		defer r.mem.mu.Unlock()
+		for id, other := range r.mem.tenants {
+			if id == tenantID {
+				continue
+			}
+			if email != "" && strings.EqualFold(other.Email, email) {
+				return domain.ErrTenantEmailTaken
+			}
+			if cuit != "" && other.CUIT == cuit {
+				return domain.ErrTenantCUITTaken
+			}
+		}
 		if t, ok := r.mem.tenants[tenantID]; ok {
 			t.BusinessName, t.CUIT, t.Email, t.UpdatedAt = businessName, cuit, email, time.Now()
 		}
@@ -520,5 +531,11 @@ func (r *MySQLRepository) UpdateTenantProfile(ctx context.Context, tenantID, bus
 	}
 	_, err := r.db.ExecContext(ctx, `UPDATE tenants SET business_name = ?, cuit = ?, email = ? WHERE id = ?`,
 		businessName, nullIfEmpty(cuit), nullIfEmpty(email), tenantID)
+	if err != nil && strings.Contains(err.Error(), "Duplicate") {
+		if strings.Contains(strings.ToLower(err.Error()), "cuit") {
+			return domain.ErrTenantCUITTaken
+		}
+		return domain.ErrTenantEmailTaken
+	}
 	return err
 }

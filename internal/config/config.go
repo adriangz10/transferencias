@@ -47,10 +47,12 @@ type Config struct {
 	GeminiModel  string
 
 	// Mercado Pago API & OAuth 2.0
-	MPClientID      string
-	MPClientSecret  string
-	MPRedirectURI   string
-	MPWebhookSecret string
+	MPClientID            string
+	MPClientSecret        string
+	MPRedirectURI         string
+	MPWebhookSecret       string
+	MPPlatformAccessToken string  // Token propio de la plataforma SaaS para cobrar suscripciones (Checkout Pro)
+	USDToARSRate          float64 // Tipo de cambio USD -> ARS para las suscripciones (default 1200)
 
 	// Meta WhatsApp Cloud API
 	WAVerifyToken   string
@@ -96,35 +98,41 @@ func Load() *Config {
 	}
 
 	redisDB, _ := strconv.Atoi(getEnv("REDIS_DB", "0"))
+	usdRate, err := strconv.ParseFloat(getEnv("USD_ARS_RATE", "1200"), 64)
+	if err != nil || usdRate <= 0 {
+		usdRate = 1200
+	}
 
 	return &Config{
-		Port:            port,
-		PublicBaseURL:   getEnv("PUBLIC_BASE_URL", "http://localhost:"+port),
-		DemoMode:        demo,
-		AdminUser:       getEnv("ADMIN_USER", "admin"),
-		AdminPassword:   getEnv("ADMIN_PASSWORD", ""),
-		DBHost:          dbHost,
-		DBPort:          dbPort,
-		DBUser:          dbUser,
-		DBPassword:      dbPassword,
-		DBName:          dbName,
-		DBRootDSN:       dbRootDSN,
-		DBDSN:           dbDSN,
-		DBMigrateDSN:    migrateDSN,
-		RedisAddr:       getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:   getEnv("REDIS_PASSWORD", ""),
-		RedisDB:         redisDB,
-		MasterKey:       getEnv("MASTER_KEY", demoDefault(DemoMasterKey)),
-		GeminiAPIKey:    getEnv("GEMINI_API_KEY", ""),
-		GeminiModel:     getEnv("GEMINI_MODEL", "gemini-3.8-flash"),
-		MPClientID:      getEnv("MP_CLIENT_ID", demoDefault("MP_DEMO_CLIENT_ID")),
-		MPClientSecret:  getEnv("MP_CLIENT_SECRET", demoDefault("MP_DEMO_CLIENT_SECRET")),
-		MPRedirectURI:   getEnv("MP_REDIRECT_URI", "http://localhost:"+port+"/oauth/mp/callback"),
-		MPWebhookSecret: getEnv("MP_WEBHOOK_SECRET", demoDefault("veripago_mp_webhook_secret_demo")),
-		WAVerifyToken:   getEnv("WA_VERIFY_TOKEN", demoDefault("veripago_wa_verify_token")),
-		WAAppSecret:     getEnv("WA_APP_SECRET", ""),
-		WAAccessToken:   getEnv("WA_ACCESS_TOKEN", ""),
-		WAPhoneNumberID: getEnv("WA_PHONE_NUMBER_ID", ""),
+		Port:                  port,
+		PublicBaseURL:         getEnv("PUBLIC_BASE_URL", "http://localhost:"+port),
+		DemoMode:              demo,
+		AdminUser:             getEnv("ADMIN_USER", "admin"),
+		AdminPassword:         getEnv("ADMIN_PASSWORD", ""),
+		DBHost:                dbHost,
+		DBPort:                dbPort,
+		DBUser:                dbUser,
+		DBPassword:            dbPassword,
+		DBName:                dbName,
+		DBRootDSN:             dbRootDSN,
+		DBDSN:                 dbDSN,
+		DBMigrateDSN:          migrateDSN,
+		RedisAddr:             getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:         getEnv("REDIS_PASSWORD", ""),
+		RedisDB:               redisDB,
+		MasterKey:             getEnv("MASTER_KEY", demoDefault(DemoMasterKey)),
+		GeminiAPIKey:          getEnv("GEMINI_API_KEY", ""),
+		GeminiModel:           getEnv("GEMINI_MODEL", "gemini-3.8-flash"),
+		MPClientID:            getEnv("MP_CLIENT_ID", demoDefault("MP_DEMO_CLIENT_ID")),
+		MPClientSecret:        getEnv("MP_CLIENT_SECRET", demoDefault("MP_DEMO_CLIENT_SECRET")),
+		MPRedirectURI:         getEnv("MP_REDIRECT_URI", "http://localhost:"+port+"/oauth/mp/callback"),
+		MPWebhookSecret:       getEnv("MP_WEBHOOK_SECRET", demoDefault("veripago_mp_webhook_secret_demo")),
+		MPPlatformAccessToken: getEnv("MP_PLATFORM_ACCESS_TOKEN", ""),
+		USDToARSRate:          usdRate,
+		WAVerifyToken:         getEnv("WA_VERIFY_TOKEN", demoDefault("veripago_wa_verify_token")),
+		WAAppSecret:           getEnv("WA_APP_SECRET", ""),
+		WAAccessToken:         getEnv("WA_ACCESS_TOKEN", ""),
+		WAPhoneNumberID:       getEnv("WA_PHONE_NUMBER_ID", ""),
 	}
 }
 

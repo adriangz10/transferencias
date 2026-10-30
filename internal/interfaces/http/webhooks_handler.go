@@ -106,19 +106,22 @@ func NewWebhooksHandler(
 
 func (h *WebhooksHandler) RegisterRoutes(mux *http.ServeMux) {
 	admin := h.requireAdmin
+	superAdmin := h.requireSuperAdmin
 
 	// Webhooks oficiales (autenticados por firma HMAC, no por contraseña)
 	mux.HandleFunc("/webhooks/whatsapp", h.handleWhatsAppWebhook)
 	mux.HandleFunc("/webhooks/mercadopago", h.handleMPWebhook)
+	mux.HandleFunc("/webhooks/mercadopago/platform", h.handleMPPlatformWebhook)
 
 	// OAuth 2.0 con Mercado Pago (el callback se valida con el state firmado)
 	mux.HandleFunc("/oauth/mp/connect", admin(h.handleMPOAuthConnect))
 	mux.HandleFunc("/oauth/mp/callback", h.handleMPOAuthCallback)
 
-	// API del panel (requiere ADMIN_USER / ADMIN_PASSWORD)
+	// API del panel por comercio (requiere sesión de comercio o Super-Admin)
 	mux.HandleFunc("/api/v1/dashboard", admin(h.handleDashboardData))
 	mux.HandleFunc("/api/v1/senders", admin(h.handleSenders))
 	mux.HandleFunc("/api/v1/account", admin(h.handleAccount))
+	mux.HandleFunc("/api/v1/account/password", admin(h.handleChangePassword))
 	mux.HandleFunc("/api/v1/plan", admin(h.handleUpdatePlan))
 	mux.HandleFunc("/api/v1/posnet/charge", admin(h.handleCreatePosnetCharge))
 	mux.HandleFunc("/api/v1/receipts/upload", admin(h.handleReceiptUpload))
@@ -127,6 +130,16 @@ func (h *WebhooksHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/customers", admin(h.handleCustomers))
 	mux.HandleFunc("/api/v1/business", admin(h.handleBusiness))
 
+	// Facturación y suscripciones del comercio
+	mux.HandleFunc("/api/v1/billing/orders", admin(h.handleBillingOrders))
+	mux.HandleFunc("/api/v1/billing/checkout", admin(h.handleBillingCheckout))
+	mux.HandleFunc("/api/v1/billing/simulate-pay", admin(h.handleBillingSimulatePay))
+
+	// API de Super-Admin (gestión multi-tenant de la plataforma)
+	mux.HandleFunc("/api/v1/superadmin/tenants", superAdmin(h.handleSuperAdminTenants))
+	mux.HandleFunc("/api/v1/superadmin/impersonate", superAdmin(h.handleSuperAdminImpersonate))
+	mux.HandleFunc("/api/v1/superadmin/subscriptions/approve", superAdmin(h.handleSuperAdminApproveSubscription))
+
 	// Simulador: solo con DEMO_MODE=true
 	mux.HandleFunc("/api/v1/simulate/receipt", admin(h.demoOnly(h.handleSimulateReceipt)))
 	mux.HandleFunc("/api/v1/simulate/mp-webhook", admin(h.demoOnly(h.handleSimulateMPWebhook)))
@@ -134,9 +147,11 @@ func (h *WebhooksHandler) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/health", h.handleHealth)
 
-	// Login del panel
+	// Login y Registro del panel
 	mux.HandleFunc("/login", h.handleLogin)
-	mux.HandleFunc("/api/v1/login", h.handleLogin) // el formulario de Angular envía acá (también en desarrollo)
+	mux.HandleFunc("/api/v1/login", h.handleLogin)
+	mux.HandleFunc("/registro", h.handleRegister)
+	mux.HandleFunc("/api/v1/register", h.handleRegister)
 	mux.HandleFunc("/logout", h.handleLogout)
 
 	// Panel Web (Angular). Los archivos estáticos son públicos; las páginas piden sesión.
@@ -736,7 +751,7 @@ func (h *WebhooksHandler) handleMPWebhook(w http.ResponseWriter, r *http.Request
 
 	if acc == nil {
 		if h.cfg.DemoMode {
-			acc, _ = h.repo.GetActiveMPAccount(r.Context(), h.tenantID)
+			acc, _ = h.repo.GetActiveMPAccount(r.Context(), h.activeTenantID(r))
 		}
 		if acc == nil {
 			log.Printf("ℹ️ Webhook MP para user_id %d sin cuenta vinculada: ignorado", body.UserID)
@@ -874,7 +889,7 @@ func orDash(s string) string {
 
 // handleMPOAuthConnect redirige a la autorización OAuth 2.0 de Mercado Pago con un state firmado.
 func (h *WebhooksHandler) handleMPOAuthConnect(w http.ResponseWriter, r *http.Request) {
-	state := h.oauthState.Issue(h.tenantID)
+	state := h.oauthState.Issue(h.activeTenantID(r))
 
 	// En modo demo la vinculación siempre es simulada: nunca se toca una cuenta real
 	if h.cfg.DemoMode {
@@ -958,7 +973,7 @@ func (h *WebhooksHandler) handleMPOAuthCallback(w http.ResponseWriter, r *http.R
 // handleDashboardData devuelve el estado completo del comercio para el Dashboard Web.
 func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantID := h.tenantID
+	tenantID := h.activeTenantID(r)
 
 	tenant, _ := h.repo.GetTenantByID(ctx, tenantID)
 	mpAcc, _ := h.repo.GetActiveMPAccount(ctx, tenantID)
@@ -966,20 +981,25 @@ func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Req
 	payments, _ := h.repo.ListMPPayments(ctx, tenantID, 50)
 	pendingQueue, _ := h.queue.ListPendingReceipts(ctx, tenantID)
 	chargeOrders, _ := h.queue.ListChargeOrders(ctx, tenantID)
+	subOrders, _ := h.repo.ListSubscriptionOrders(ctx, tenantID, 10)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"tenant":        tenant,
-		"plans":         domain.GetPlanSpecs(),
-		"mp_account":    mpAcc,
-		"senders":       senders,
-		"today":         h.todayStats(r, tenantID),
-		"payments":      payments,
-		"pending_queue": pendingQueue,
-		"charge_orders": chargeOrders,
-		"wa_messages":   h.waClient.ListMessages(),
-		"demo_mode":     h.cfg.DemoMode,
-		"auth_enabled":  h.authEnabled(),
-		"admin_user":    h.cfg.AdminUser,
+		"tenant":              tenant,
+		"plans":               domain.GetPlanSpecs(),
+		"mp_account":          mpAcc,
+		"senders":             senders,
+		"today":               h.todayStats(r, tenantID),
+		"payments":            payments,
+		"pending_queue":       pendingQueue,
+		"charge_orders":       chargeOrders,
+		"subscription_orders": subOrders,
+		"usd_ars_rate":        h.cfg.USDToARSRate,
+		"wa_messages":         h.waClient.ListMessages(),
+		"demo_mode":           h.cfg.DemoMode,
+		"auth_enabled":        h.authEnabled() || h.isLoggedIn(r),
+		"is_super_admin":      h.isSuperAdmin(r),
+		"impersonating":       h.isImpersonating(r),
+		"admin_user":          h.cfg.AdminUser,
 		"system": map[string]interface{}{
 			"mysql_connected": h.repo.IsUsingMySQL(),
 			"redis_connected": h.queue.IsUsingRedis(),
@@ -990,7 +1010,7 @@ func (h *WebhooksHandler) handleDashboardData(w http.ResponseWriter, r *http.Req
 
 func (h *WebhooksHandler) handleSenders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	tenantID := h.tenantID
+	tenantID := h.activeTenantID(r)
 
 	switch r.Method {
 	case http.MethodPost:
@@ -1020,12 +1040,37 @@ func (h *WebhooksHandler) handleSenders(w http.ResponseWriter, r *http.Request) 
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Nombre o teléfono inválido (usá solo dígitos con código de país, ej: 5491155004444)"})
 			return
 		}
+
+		// Verificamos el límite de números de WhatsApp del plan del comercio
+		if tenant, err := h.repo.GetTenantByID(ctx, tenantID); err == nil && tenant != nil {
+			if spec, ok := domain.GetPlanSpecs()[tenant.PlanType]; ok && spec.MaxAuthorizedPhone > 0 {
+				existing, _ := h.repo.ListAuthorizedSenders(ctx, tenantID)
+				alreadyExists := false
+				for _, ex := range existing {
+					if normalizePhone(ex.PhoneNumber) == phone {
+						alreadyExists = true
+						break
+					}
+				}
+				if !alreadyExists && len(existing) >= spec.MaxAuthorizedPhone {
+					writeJSON(w, http.StatusForbidden, map[string]string{
+						"error": fmt.Sprintf("Alcanzaste el límite de %d números de WhatsApp de tu plan (%s). Mejorá tu plan en Configuración para agregar más personas.", spec.MaxAuthorizedPhone, spec.Name),
+					})
+					return
+				}
+			}
+		}
+
 		role := domain.SenderRole(strings.ToUpper(strings.TrimSpace(req.Role)))
 		if role != domain.RoleOwner && role != domain.RoleCashier && role != domain.RoleDelivery {
 			role = domain.RoleCashier
 		}
 		sender := &domain.AuthorizedSender{TenantID: tenantID, PhoneNumber: phone, EmployeeName: name, Role: role}
 		if err := h.repo.CreateAuthorizedSender(ctx, sender); err != nil {
+			if errors.Is(err, domain.ErrPhoneAlreadyInUse) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+				return
+			}
 			log.Printf("⚠️ Error creando empleado: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "No se pudo guardar el empleado"})
 			return
@@ -1058,7 +1103,7 @@ func (h *WebhooksHandler) handleAccount(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "JSON inválido"})
 		return
 	}
-	status, msg := h.updateAccountDestination(r.Context(), h.tenantID, req.ExpectedAlias, req.ExpectedCVU)
+	status, msg := h.updateAccountDestination(r.Context(), h.activeTenantID(r), req.ExpectedAlias, req.ExpectedCVU)
 	if status != http.StatusOK {
 		writeJSON(w, status, map[string]string{"error": msg})
 		return
@@ -1114,7 +1159,16 @@ func (h *WebhooksHandler) handleUpdatePlan(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "La ventana debe estar entre 5 y 1440 minutos"})
 		return
 	}
-	if err := h.repo.UpdateTenantPlan(r.Context(), h.tenantID, spec.Plan, spec.MonthlyQuota, req.TimeWindowMinutes); err != nil {
+	tenantID := h.activeTenantID(r)
+	if !h.isSuperAdmin(r) && !h.cfg.DemoMode {
+		// Un comercio en producción solo puede cambiar su ventana horaria desde acá;
+		// el upgrade de plan se realiza mediante /api/v1/billing/checkout
+		if current, err := h.repo.GetTenantByID(r.Context(), tenantID); err == nil && current != nil && spec.Plan != current.PlanType {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "Para cambiar de plan usá la opción de Suscripción / Checkout"})
+			return
+		}
+	}
+	if err := h.repo.UpdateTenantPlan(r.Context(), tenantID, spec.Plan, spec.MonthlyQuota, req.TimeWindowMinutes); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "No se pudo actualizar el plan"})
 		return
 	}
@@ -1141,14 +1195,15 @@ func (h *WebhooksHandler) handleCreatePosnetCharge(w http.ResponseWriter, r *htt
 	if req.Reference == "" {
 		req.Reference = "Venta Mostrador"
 	}
-	acc, _ := h.repo.GetActiveMPAccount(r.Context(), h.tenantID)
+	tenantID := h.activeTenantID(r)
+	acc, _ := h.repo.GetActiveMPAccount(r.Context(), tenantID)
 	dest := h.chargeDestination(acc)
 	if dest == "" {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "Configurá el alias o CVU de cobro primero"})
 		return
 	}
 
-	order, err := h.queue.CreateUniqueChargeOrder(r.Context(), h.tenantID, req.RequestedBy, "", req.Reference, dest, req.BaseAmount)
+	order, err := h.queue.CreateUniqueChargeOrder(r.Context(), tenantID, req.RequestedBy, "", req.Reference, dest, req.BaseAmount)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, queue.ErrNoUniqueAmountAvailable) {
@@ -1165,8 +1220,9 @@ func (h *WebhooksHandler) handleCreatePosnetCharge(w http.ResponseWriter, r *htt
 // más de lo que aguanta un proxy o túnel (504), así que responde enseguida con un job_id y el
 // panel consulta el resultado con GET ?job=<id>.
 func (h *WebhooksHandler) handleReceiptUpload(w http.ResponseWriter, r *http.Request) {
+	tenantID := h.activeTenantID(r)
 	if r.Method == http.MethodGet {
-		job, ok := h.uploads.get(r.URL.Query().Get("job"))
+		job, ok := h.uploads.get(r.URL.Query().Get("job"), tenantID)
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "No encontramos ese análisis. Subí el comprobante de nuevo."})
 			return
@@ -1199,7 +1255,7 @@ func (h *WebhooksHandler) handleReceiptUpload(w http.ResponseWriter, r *http.Req
 		mimeType = http.DetectContentType(fileBytes)
 	}
 
-	tenant, err := h.repo.GetTenantByID(r.Context(), h.tenantID)
+	tenant, err := h.repo.GetTenantByID(r.Context(), tenantID)
 	if err != nil || tenant == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Comercio no encontrado"})
 		return
@@ -1209,7 +1265,7 @@ func (h *WebhooksHandler) handleReceiptUpload(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Hay muchos comprobantes analizándose. Probá de nuevo en unos segundos."})
 		return
 	}
-	jobID := h.uploads.start()
+	jobID := h.uploads.start(tenantID)
 	h.runInBackground(waProcessTimeout, func(ctx context.Context) {
 		outcome, err := h.processReceiptForTenant(ctx, tenant, panelSender, "panel_"+uuid.NewString(), fileBytes, mimeType)
 		if err != nil {
@@ -1234,6 +1290,7 @@ const (
 )
 
 type uploadJob struct {
+	TenantID  string                      `json:"-"`
 	Status    string                      `json:"status"`
 	Outcome   *domain.VerificationOutcome `json:"outcome,omitempty"`
 	Error     string                      `json:"error,omitempty"`
@@ -1247,7 +1304,7 @@ type uploadJobs struct {
 
 func newUploadJobs() *uploadJobs { return &uploadJobs{jobs: make(map[string]*uploadJob)} }
 
-func (u *uploadJobs) start() string {
+func (u *uploadJobs) start(tenantID string) string {
 	id := uuid.NewString()
 	now := time.Now()
 	u.mu.Lock()
@@ -1257,7 +1314,7 @@ func (u *uploadJobs) start() string {
 			delete(u.jobs, k)
 		}
 	}
-	u.jobs[id] = &uploadJob{Status: uploadProcessing, createdAt: now}
+	u.jobs[id] = &uploadJob{TenantID: tenantID, Status: uploadProcessing, createdAt: now}
 	return id
 }
 
@@ -1275,11 +1332,11 @@ func (u *uploadJobs) finish(id string, outcome *domain.VerificationOutcome, errM
 	j.Status, j.Outcome = uploadDone, outcome
 }
 
-func (u *uploadJobs) get(id string) (uploadJob, bool) {
+func (u *uploadJobs) get(id, tenantID string) (uploadJob, bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	j, ok := u.jobs[id]
-	if !ok {
+	if !ok || (j.TenantID != "" && tenantID != "" && j.TenantID != tenantID) {
 		return uploadJob{}, false
 	}
 	return *j, true
@@ -1333,7 +1390,7 @@ func (h *WebhooksHandler) handleSimulateReceipt(w http.ResponseWriter, r *http.R
 	}
 
 	ctx := r.Context()
-	tenant, err := h.repo.GetTenantByID(ctx, h.tenantID)
+	tenant, err := h.repo.GetTenantByID(ctx, h.activeTenantID(r))
 	if err != nil || tenant == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Comercio demo no encontrado"})
 		return
@@ -1663,7 +1720,7 @@ func (h *WebhooksHandler) handleSimulateMPWebhook(w http.ResponseWriter, r *http
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req)
 
 	ctx := r.Context()
-	tenantID := h.tenantID
+	tenantID := h.activeTenantID(r)
 	coelsa := randomCoelsa()
 
 	// Sin monto: tomamos el primer comprobante en espera (con su COELSA) o la primera orden /cobrar

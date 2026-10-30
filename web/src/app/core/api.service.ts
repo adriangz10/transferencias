@@ -2,7 +2,17 @@ import { HttpClient, HttpErrorResponse, HttpInterceptorFn, HttpParams } from '@a
 import { inject, Injectable } from '@angular/core';
 import { catchError, firstValueFrom, tap, throwError } from 'rxjs';
 import { UiService } from './ui.service';
-import { ChargeOrder, Customer, CustomerPage, Dashboard, Outcome, ValidationPage } from './models';
+import {
+  ChargeOrder,
+  Customer,
+  CustomerPage,
+  Dashboard,
+  Outcome,
+  SubscriptionOrder,
+  SuperAdminData,
+  Tenant,
+  ValidationPage,
+} from './models';
 
 /** Sesión vencida → login. Cualquier otro error se muestra arriba del panel. */
 export const apiErrorInterceptor: HttpInterceptorFn = (req, next) => {
@@ -33,12 +43,70 @@ export interface HistoryQuery {
   customerId?: string;
 }
 
+export interface RegisterPayload {
+  business_name: string;
+  email: string;
+  password: string;
+  cuit?: string;
+  owner_phone?: string;
+}
+
+export interface SuperAdminTenantPayload {
+  tenant_id?: string;
+  business_name: string;
+  cuit?: string;
+  email: string;
+  password?: string;
+  plan_type: string;
+  subscription_status: string;
+  monthly_quota?: number;
+  is_active: boolean;
+  reset_quota?: boolean;
+}
+
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private http = inject(HttpClient);
 
   dashboard(): Promise<Dashboard> {
     return firstValueFrom(this.http.get<Dashboard>('/api/v1/dashboard'));
+  }
+
+  register(payload: RegisterPayload): Promise<{ status: string; tenant: Tenant }> {
+    return this.post('/api/v1/register', payload);
+  }
+
+  changePassword(currentPassword: string, newPassword: string): Promise<{ status: string }> {
+    return this.post('/api/v1/account/password', {
+      current_password: currentPassword,
+      new_password: newPassword,
+    });
+  }
+
+  checkoutPlan(plan: string): Promise<{ order: SubscriptionOrder; checkout_url: string; payment_mode: string }> {
+    return this.post('/api/v1/billing/checkout', { plan });
+  }
+
+  simulateSubscriptionPay(orderId: string): Promise<{ status: string; order: SubscriptionOrder }> {
+    return this.post('/api/v1/billing/simulate-pay', { order_id: orderId });
+  }
+
+  superAdminData(q = ''): Promise<SuperAdminData> {
+    let params = new HttpParams();
+    if (q.trim()) params = params.set('q', q.trim());
+    return firstValueFrom(this.http.get<SuperAdminData>('/api/v1/superadmin/tenants', { params }));
+  }
+
+  superAdminSaveTenant(payload: SuperAdminTenantPayload): Promise<unknown> {
+    return this.post('/api/v1/superadmin/tenants', payload);
+  }
+
+  superAdminImpersonate(tenantId: string): Promise<{ status: string; impersonating: boolean; active_tenant_id: string }> {
+    return this.post('/api/v1/superadmin/impersonate', { tenant_id: tenantId });
+  }
+
+  superAdminApproveSubscription(orderId: string): Promise<{ status: string; order: SubscriptionOrder }> {
+    return this.post('/api/v1/superadmin/subscriptions/approve', { order_id: orderId });
   }
 
   validations(q: HistoryQuery): Promise<ValidationPage> {

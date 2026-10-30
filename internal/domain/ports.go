@@ -58,9 +58,20 @@ type Repository interface {
 	SearchCustomers(ctx context.Context, tenantID string, f CustomerFilter) ([]CustomerSummary, int, error)
 	GetCustomerSummary(ctx context.Context, tenantID, customerID string) (*CustomerSummary, error)
 	CustomerSummariesByIDs(ctx context.Context, tenantID string, ids []string) (map[string]CustomerSummary, error)
-	// EnsureTenant devuelve el comercio de la instalación (lo crea vacío si no hay ninguno).
+	// EnsureTenant devuelve el comercio inicial (lo crea vacío si no hay ninguno).
 	EnsureTenant(ctx context.Context) (*Tenant, error)
 	UpdateTenantProfile(ctx context.Context, tenantID, businessName, cuit, email string) error
+
+	// Multi-Tenant SaaS: registro, autenticación, suscripciones y Super-Admin
+	CreateTenant(ctx context.Context, t *Tenant) error
+	GetTenantByEmail(ctx context.Context, email string) (*Tenant, error)
+	UpdateTenantPassword(ctx context.Context, tenantID, passwordHash string) error
+	UpdateTenantAdmin(ctx context.Context, tenantID string, plan PlanType, quota int, isActive bool, subStatus string, expiresAt *time.Time, resetQuota bool) error
+	ListTenantsAdmin(ctx context.Context, query string) ([]TenantAdminSummary, PlatformStats, error)
+	CreateSubscriptionOrder(ctx context.Context, o *SubscriptionOrder) error
+	GetSubscriptionOrder(ctx context.Context, orderID string) (*SubscriptionOrder, error)
+	ApproveSubscriptionOrder(ctx context.Context, orderID string, mpPaymentID int64) (*SubscriptionOrder, error)
+	ListSubscriptionOrders(ctx context.Context, tenantID string, limit int) ([]*SubscriptionOrder, error)
 }
 
 // ReceiptExtractor define el puerto para extracción forense multimodal (Gemini 2.5 Flash)

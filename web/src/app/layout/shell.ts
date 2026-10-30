@@ -1,5 +1,6 @@
 import { ChangeDetectionStrategy, Component, computed, DestroyRef, effect, inject } from '@angular/core';
 import { Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
+import { ApiService } from '../core/api.service';
 import { DashboardStore } from '../core/dashboard.store';
 import { UiService } from '../core/ui.service';
 import { Icon } from '../shared/icon';
@@ -20,7 +21,16 @@ import { Icon } from '../shared/icon';
             <app-icon name="check" [size]="18" [stroke]="2.5" />
           </div>
           <div class="min-w-0 leading-tight">
-            <div class="text-sm font-semibold">VeriPago</div>
+            <div class="flex items-center gap-1.5 text-sm font-semibold">
+              <span>VeriPago</span>
+              @if (store.data()?.is_super_admin) {
+                <span
+                  class="rounded bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white dark:bg-zinc-100 dark:text-zinc-900"
+                >
+                  ADMIN
+                </span>
+              }
+            </div>
             <div class="muted truncate text-xs">{{ businessName() }}</div>
           </div>
         </div>
@@ -46,13 +56,11 @@ import { Icon } from '../shared/icon';
           >
             <app-icon [name]="ui.theme() === 'dark' ? 'sun' : 'moon'" [size]="18" />
           </button>
-          @if (store.data()?.auth_enabled) {
-            <form method="post" action="/logout">
-              <button class="btn btn-ghost px-2" type="submit" title="Salir" aria-label="Salir">
-                <app-icon name="logout" [size]="18" />
-              </button>
-            </form>
-          }
+          <form method="post" action="/logout">
+            <button class="btn btn-ghost px-2" type="submit" title="Cambiar cuenta / Salir" aria-label="Salir">
+              <app-icon name="logout" [size]="18" />
+            </button>
+          </form>
         </div>
       </div>
 
@@ -71,6 +79,18 @@ import { Icon } from '../shared/icon';
     </header>
 
     <main class="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
+      @if (store.data()?.impersonating) {
+        <div
+          class="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-indigo-200 bg-indigo-50 px-4 py-2.5 text-sm text-indigo-900 dark:border-indigo-400/20 dark:bg-indigo-400/10 dark:text-indigo-200"
+        >
+          <span>
+            Estás inspeccionando el panel de <b class="font-semibold">{{ businessName() }}</b> como Super-Admin.
+          </span>
+          <button class="btn btn-secondary btn-sm" type="button" (click)="stopImpersonating()">
+            Volver a Super-Admin
+          </button>
+        </div>
+      }
       @if (store.demo()) {
         <div
           class="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-sm text-amber-900 dark:border-amber-400/20 dark:bg-amber-400/10 dark:text-amber-200"
@@ -103,11 +123,14 @@ import { Icon } from '../shared/icon';
   `,
 })
 export class Shell {
+  private readonly api = inject(ApiService);
   protected readonly store = inject(DashboardStore);
   protected readonly ui = inject(UiService);
   private readonly router = inject(Router);
 
-  protected readonly businessName = computed(() => this.store.data()?.tenant?.business_name || 'Completá los datos del comercio');
+  protected readonly businessName = computed(
+    () => this.store.data()?.tenant?.business_name || 'Completá los datos del comercio',
+  );
   protected readonly tabs = computed(() => {
     const t = [
       { path: '/', label: 'Inicio' },
@@ -116,6 +139,7 @@ export class Shell {
       { path: '/configuracion', label: 'Configuración' },
     ];
     if (this.store.demo()) t.push({ path: '/pruebas', label: 'Pruebas' });
+    if (this.store.data()?.is_super_admin) t.push({ path: '/superadmin', label: 'Super-Admin' });
     return t;
   });
 
@@ -125,6 +149,17 @@ export class Shell {
     effect(() => {
       const d = this.store.data();
       if (d && !d.demo_mode && this.router.url.startsWith('/pruebas')) this.router.navigateByUrl('/');
+      if (d && !d.is_super_admin && this.router.url.startsWith('/superadmin')) this.router.navigateByUrl('/');
     });
+  }
+
+  protected async stopImpersonating(): Promise<void> {
+    try {
+      await this.api.superAdminImpersonate('');
+      await this.store.refresh();
+      await this.router.navigateByUrl('/superadmin');
+    } catch {
+      /* el interceptor muestra el error */
+    }
   }
 }

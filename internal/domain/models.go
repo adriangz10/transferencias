@@ -12,6 +12,10 @@ var (
 	ErrPaymentNotFound        = errors.New("no se encontró un pago acreditado disponible")
 	ErrPaymentAmountMismatch  = errors.New("el pago existe pero el monto no coincide con el comprobante")
 	ErrValidationNotFound     = errors.New("el comprobante no existe")
+	ErrTenantEmailTaken       = errors.New("ya existe un comercio registrado con ese email")
+	ErrTenantCUITTaken        = errors.New("ya existe un comercio registrado con ese CUIT")
+	ErrPhoneAlreadyInUse      = errors.New("ese número de WhatsApp ya está registrado en otro comercio")
+	ErrSubscriptionNotFound   = errors.New("la orden de suscripción no existe")
 )
 
 // ChargeOrderIDPrefix identifica en consumed_by_receipt_id los pagos tomados por una orden /cobrar.
@@ -149,7 +153,7 @@ type PlanSpec struct {
 
 // GetPlanSpecs devuelve el catálogo de planes definido en la Sección 1.3 del PRD
 func GetPlanSpecs() map[PlanType]PlanSpec {
-	return map[PlanType]PlanSpec{
+	return map[PlanType]PlanSpec {
 		PlanFreeTrial: {
 			Plan:               PlanFreeTrial,
 			Name:               "Free Trial",
@@ -199,18 +203,60 @@ func GetPlanSpecs() map[PlanType]PlanSpec {
 
 // Tenant representa un comercio suscripto (Tabla: tenants)
 type Tenant struct {
-	ID                string    `json:"id"`
-	BusinessName      string    `json:"business_name"`
-	CUIT              string    `json:"cuit"`
-	Email             string    `json:"email"`
-	PasswordHash      string    `json:"-"`
-	PlanType          PlanType  `json:"plan_type"`
-	MonthlyQuota      int       `json:"monthly_quota"`
-	UsedQuota         int       `json:"used_quota"`
-	TimeWindowMinutes int       `json:"time_window_minutes"`
-	IsActive          bool      `json:"is_active"`
-	CreatedAt         time.Time `json:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at"`
+	ID                 string     `json:"id"`
+	BusinessName       string     `json:"business_name"`
+	CUIT               string     `json:"cuit"`
+	Email              string     `json:"email"`
+	PasswordHash       string     `json:"-"`
+	PlanType           PlanType   `json:"plan_type"`
+	MonthlyQuota       int        `json:"monthly_quota"`
+	UsedQuota          int        `json:"used_quota"`
+	TimeWindowMinutes  int        `json:"time_window_minutes"`
+	SubscriptionStatus string     `json:"subscription_status"` // TRIAL | ACTIVE | PAST_DUE | CANCELLED
+	PlanExpiresAt      *time.Time `json:"plan_expires_at,omitempty"`
+	IsActive           bool       `json:"is_active"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+// SubscriptionOrder representa una orden de pago/suscripción de un comercio hacia la plataforma SaaS
+type SubscriptionOrder struct {
+	ID             string     `json:"id"`
+	TenantID       string     `json:"tenant_id"`
+	BusinessName   string     `json:"business_name,omitempty"`
+	TenantEmail    string     `json:"tenant_email,omitempty"`
+	PlanType       PlanType   `json:"plan_type"`
+	PriceUSD       int        `json:"price_usd"`
+	AmountARS      float64    `json:"amount_ars"`
+	Status         string     `json:"status"`       // PENDING | APPROVED | REJECTED | CANCELLED
+	PaymentMode    string     `json:"payment_mode"` // MP_CHECKOUT | DEMO | MANUAL
+	MPPreferenceID string     `json:"mp_preference_id,omitempty"`
+	MPPaymentID    int64      `json:"mp_payment_id,omitempty"`
+	CheckoutURL    string     `json:"checkout_url,omitempty"`
+	PaidAt         *time.Time `json:"paid_at,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+// TenantAdminSummary resume el estado de un comercio para el panel de Super-Admin
+type TenantAdminSummary struct {
+	Tenant
+	HasPassword    bool   `json:"has_password"`
+	MPConnected    bool   `json:"mp_connected"`
+	MPUserID       int64  `json:"mp_user_id,omitempty"`
+	ExpectedAlias  string `json:"expected_alias,omitempty"`
+	SendersCount   int    `json:"senders_count"`
+	TotalValidated int    `json:"total_validated"`
+}
+
+// PlatformStats resume las métricas globales del SaaS para el Super-Admin
+type PlatformStats struct {
+	TotalTenants       int     `json:"total_tenants"`
+	ActiveTenants      int     `json:"active_tenants"`
+	PaidSubscriptions  int     `json:"paid_subscriptions"`
+	MonthlyValidations int     `json:"monthly_validations"`
+	ApprovedRevenueARS float64 `json:"approved_revenue_ars"`
+	PendingOrdersCount int     `json:"pending_orders_count"`
 }
 
 // MPAccount representa una cuenta vinculada de Mercado Pago (Tabla: mp_accounts)

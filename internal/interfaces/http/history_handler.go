@@ -84,7 +84,7 @@ func parseValidationFilter(r *http.Request) (domain.ValidationFilter, error) {
 
 // handleValidations lista el historial paginado (GET) o borra un comprobante (DELETE).
 func (h *WebhooksHandler) handleValidations(w http.ResponseWriter, r *http.Request) {
-	tenantID := h.tenantID
+	tenantID := h.activeTenantID(r)
 	switch r.Method {
 	case http.MethodGet:
 		f, err := parseValidationFilter(r)
@@ -185,11 +185,12 @@ func (h *WebhooksHandler) handleExportValidationsCSV(w http.ResponseWriter, r *h
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	tenantID := h.activeTenantID(r)
 	var all []*domain.ReceiptValidation
 	const pageSize = 200
 	for offset := 0; offset < csvExportMax; offset += pageSize {
 		f.Limit, f.Offset = pageSize, offset
-		page, total, err := h.repo.SearchReceiptValidations(r.Context(), h.tenantID, f)
+		page, total, err := h.repo.SearchReceiptValidations(r.Context(), tenantID, f)
 		if err != nil {
 			http.Error(w, "No se pudo exportar", http.StatusInternalServerError)
 			return

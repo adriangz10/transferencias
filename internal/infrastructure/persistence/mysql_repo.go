@@ -74,6 +74,7 @@ type inMemoryStore struct {
 	payments     map[string]*domain.MPPayment // key: tenantID + ":" + mpPaymentID
 	validations  []*domain.ReceiptValidation
 	customers    map[string]*domain.Customer // key: tenantID + "|" + identity_key
+	subOrders    map[string]*domain.SubscriptionOrder
 }
 
 func newInMemoryStore() *inMemoryStore {
@@ -85,6 +86,7 @@ func newInMemoryStore() *inMemoryStore {
 		payments:     make(map[string]*domain.MPPayment),
 		validations:  make([]*domain.ReceiptValidation, 0),
 		customers:    make(map[string]*domain.Customer),
+		subOrders:    make(map[string]*domain.SubscriptionOrder),
 	}
 }
 
@@ -660,6 +662,9 @@ func (r *MySQLRepository) GetTenantByID(ctx context.Context, tenantID string) (*
 		defer r.mem.mu.Unlock()
 		if t, ok := r.mem.tenants[tenantID]; ok {
 			copyT := *t
+			if copyT.SubscriptionStatus == "" {
+				copyT.SubscriptionStatus = "TRIAL"
+			}
 			if p, ok := r.mem.quotaPeriods[tenantID]; ok && p != currentQuotaPeriod() {
 				copyT.UsedQuota = 0 // cambió el mes: la cuota se reinicia
 			}
@@ -671,15 +676,18 @@ func (r *MySQLRepository) GetTenantByID(ctx context.Context, tenantID string) (*
 	var t domain.Tenant
 	var planStr string
 	var period sql.NullString
+	var expiresAt sql.NullTime
 	query := `
 		SELECT id, business_name, COALESCE(cuit, ''), COALESCE(email, ''), COALESCE(password_hash, ''), plan_type,
-		       monthly_quota, used_quota, quota_period, time_window_minutes, is_active,
+		       monthly_quota, used_quota, quota_period, time_window_minutes,
+		       COALESCE(subscription_status, 'TRIAL'), plan_expires_at, is_active,
 		       created_at, updated_at
 		FROM tenants WHERE id = ?
 	`
 	err := r.db.QueryRowContext(ctx, query, tenantID).Scan(
 		&t.ID, &t.BusinessName, &t.CUIT, &t.Email, &t.PasswordHash, &planStr,
-		&t.MonthlyQuota, &t.UsedQuota, &period, &t.TimeWindowMinutes, &t.IsActive,
+		&t.MonthlyQuota, &t.UsedQuota, &period, &t.TimeWindowMinutes,
+		&t.SubscriptionStatus, &expiresAt, &t.IsActive,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
@@ -687,6 +695,10 @@ func (r *MySQLRepository) GetTenantByID(ctx context.Context, tenantID string) (*
 	}
 	if period.Valid && period.String != currentQuotaPeriod() {
 		t.UsedQuota = 0 // cambió el mes: la cuota se reinicia
+	}
+	if expiresAt.Valid {
+		exp := expiresAt.Time
+		t.PlanExpiresAt = &exp
 	}
 	t.PlanType = domain.PlanType(planStr)
 	return &t, nil
@@ -774,6 +786,9 @@ func (r *MySQLRepository) GetTenantBySenderPhone(ctx context.Context, phone stri
 	t, err := r.GetTenantByID(ctx, s.TenantID)
 	if err != nil {
 		return nil, nil, err
+	}
+	if !t.IsActive {
+		return nil, nil, sql.ErrNoRows
 	}
 	return t, &s, nil
 }
@@ -956,9 +971,31 @@ func (r *MySQLRepository) CreateAuthorizedSender(ctx context.Context, s *domain.
 	if r.db == nil {
 		r.mem.mu.Lock()
 		defer r.mem.mu.Unlock()
+		for _, other := range r.mem.senders {
+			if other.IsActive && normalizePhone(other.PhoneNumber) == s.PhoneNumber && other.TenantID != s.TenantID {
+				return domain.ErrPhoneAlreadyInUse
+			}
+			if other.TenantID == s.TenantID && normalizePhone(other.PhoneNumber) == s.PhoneNumber {
+				other.EmployeeName = s.EmployeeName
+				other.Role = s.Role
+				other.IsActive = true
+				return nil
+			}
+		}
 		copyS := *s
 		r.mem.senders[s.ID] = &copyS
 		return nil
+	}
+
+	// Un número activo solo puede pertenecer a un comercio a la vez (el bot de WhatsApp es compartido)
+	var otherTenant string
+	err := r.db.QueryRowContext(ctx, `SELECT tenant_id FROM authorized_senders WHERE phone_number = ? AND tenant_id <> ? AND is_active = TRUE LIMIT 1`,
+		s.PhoneNumber, s.TenantID).Scan(&otherTenant)
+	if err == nil && otherTenant != "" {
+		return domain.ErrPhoneAlreadyInUse
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
 	}
 
 	query := `
@@ -969,7 +1006,7 @@ func (r *MySQLRepository) CreateAuthorizedSender(ctx context.Context, s *domain.
 			role = VALUES(role),
 			is_active = TRUE
 	`
-	_, err := r.db.ExecContext(ctx, query, s.ID, s.TenantID, s.PhoneNumber, s.EmployeeName, string(s.Role))
+	_, err = r.db.ExecContext(ctx, query, s.ID, s.TenantID, s.PhoneNumber, s.EmployeeName, string(s.Role))
 	return err
 }
 

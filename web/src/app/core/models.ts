@@ -22,15 +22,79 @@ export interface Tenant {
   cuit: string;
   email: string;
   plan_type: string;
+  subscription_status?: string;
+  plan_expires_at?: string;
   monthly_quota: number;
   used_quota: number;
   time_window_minutes: number;
+  is_active?: boolean;
 }
 
 export interface PlanSpec {
   plan: string;
   name: string;
+  price_usd: number;
   monthly_quota: number;
+  max_mp_accounts: number;
+  max_authorized_phones: number;
+  owner_fraud_alerts: boolean;
+  csv_export: boolean;
+  posnet_virtual: boolean;
+}
+
+export interface SubscriptionOrder {
+  id: string;
+  tenant_id: string;
+  business_name?: string;
+  tenant_email?: string;
+  plan_type: string;
+  price_usd: number;
+  amount_ars: number;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED' | string;
+  payment_mode?: string;
+  mp_preference_id?: string;
+  mp_payment_id?: number;
+  checkout_url?: string;
+  created_at: string;
+  paid_at?: string;
+}
+
+export interface TenantAdminSummary {
+  id: string;
+  business_name: string;
+  cuit: string;
+  email: string;
+  plan_type: string;
+  subscription_status: string;
+  plan_expires_at?: string;
+  monthly_quota: number;
+  used_quota: number;
+  is_active: boolean;
+  has_password: boolean;
+  mp_connected: boolean;
+  mp_user_id?: number;
+  expected_alias?: string;
+  senders_count: number;
+  total_validated: number;
+  created_at: string;
+}
+
+export interface PlatformStats {
+  total_tenants: number;
+  active_tenants: number;
+  paid_subscriptions: number;
+  monthly_validations: number;
+  approved_revenue_ars: number;
+  pending_orders_count: number;
+}
+
+export interface SuperAdminData {
+  stats: PlatformStats;
+  tenants: TenantAdminSummary[];
+  subscription_orders: SubscriptionOrder[];
+  plans: Record<string, PlanSpec>;
+  active_tenant_id: string;
+  impersonating: boolean;
 }
 
 export interface MPAccount {
@@ -97,6 +161,10 @@ export interface Dashboard {
   payments: Payment[] | null;
   pending_queue: PendingItem[] | null;
   charge_orders: ChargeOrder[] | null;
+  subscription_orders?: SubscriptionOrder[] | null;
+  usd_ars_rate?: number;
+  is_super_admin?: boolean;
+  impersonating?: boolean;
   wa_messages: WAMessage[] | null;
   today: TodayStats;
   demo_mode: boolean;

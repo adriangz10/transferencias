@@ -8,6 +8,11 @@ export const routes: Routes = [
     loadComponent: () => import('./pages/login/login').then((m) => m.LoginPage),
   },
   {
+    path: 'registro',
+    title: 'Registrar comercio · VeriPago',
+    loadComponent: () => import('./pages/register/register').then((m) => m.RegisterPage),
+  },
+  {
     path: '',
     component: Shell,
     children: [
@@ -40,6 +45,11 @@ export const routes: Routes = [
         path: 'pruebas',
         title: 'Pruebas · VeriPago',
         loadComponent: () => import('./pages/demo/demo').then((m) => m.DemoPage),
+      },
+      {
+        path: 'superadmin',
+        title: 'Super-Admin · VeriPago',
+        loadComponent: () => import('./pages/superadmin/superadmin').then((m) => m.SuperAdminPage),
       },
     ],
   },

@@ -22,9 +22,10 @@ func (h *WebhooksHandler) handleCustomers(w http.ResponseWriter, r *http.Request
 		return
 	}
 	q := r.URL.Query()
+	tenantID := h.activeTenantID(r)
 
 	if id := strings.TrimSpace(q.Get("id")); id != "" {
-		c, err := h.repo.GetCustomerSummary(r.Context(), h.tenantID, id)
+		c, err := h.repo.GetCustomerSummary(r.Context(), tenantID, id)
 		if errors.Is(err, persistence.ErrCustomerNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "El cliente no existe"})
 			return
@@ -52,7 +53,7 @@ func (h *WebhooksHandler) handleCustomers(w http.ResponseWriter, r *http.Request
 		return
 	}
 	f := domain.CustomerFilter{Query: query, OnlyFraud: q.Get("risk") == "fraud", Limit: size, Offset: (page - 1) * size}
-	items, total, err := h.repo.SearchCustomers(r.Context(), h.tenantID, f)
+	items, total, err := h.repo.SearchCustomers(r.Context(), tenantID, f)
 	if err != nil {
 		log.Printf("⚠️ Error buscando clientes: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "No se pudo cargar la lista de clientes"})
@@ -94,13 +95,15 @@ func (h *WebhooksHandler) handleBusiness(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	if err := h.repo.UpdateTenantProfile(r.Context(), h.tenantID, name, domain.NormalizeCUIT(cuit), email); err != nil {
+	if err := h.repo.UpdateTenantProfile(r.Context(), h.activeTenantID(r), name, domain.NormalizeCUIT(cuit), email); err != nil {
 		log.Printf("⚠️ Error guardando los datos del comercio: %v", err)
+		status := http.StatusInternalServerError
 		msg := "No se pudieron guardar los datos"
-		if strings.Contains(err.Error(), "Duplicate") {
-			msg = "Ese CUIT o email ya está registrado"
+		if errors.Is(err, domain.ErrTenantEmailTaken) || errors.Is(err, domain.ErrTenantCUITTaken) || strings.Contains(err.Error(), "Duplicate") {
+			status = http.StatusConflict
+			msg = "Ese CUIT o email ya está registrado en otro comercio"
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
+		writeJSON(w, status, map[string]string{"error": msg})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
